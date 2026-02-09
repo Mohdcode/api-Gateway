@@ -370,9 +370,6 @@ middleware:
 - **Concurrency**: Uses atomic operations and sync.Map for thread safety
 - **Memory**: Consider adjusting connection pool sizes for your workload
 
-## License
-
-This project is provided as-is for educational and commercial use.
 
 ## Contributing
 
