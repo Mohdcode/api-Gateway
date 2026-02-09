@@ -1,0 +1,22 @@
+port: ":8080"
+middleware_config:
+  auth_apikey:
+    valid_keys:
+      - "abc-123"
+      - "dwe-569"
+
+services:
+  - name: users
+    route_pattern: "/users"
+    urls:
+      - "http://localhost:8081"
+      - "http://localhost:8083"
+    middleware:
+      - "auth_apikey"
+      - "rate_limit"
+      - "circuit_breaker"
+      - "metrics"
+    rate_limit_rps: 200
+    rate_limit_burst: 400
+    cb_failure_threshold: 6
+    cb_reset_timeout_seconds: 15
