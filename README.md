@@ -24,6 +24,45 @@ Client → API Gateway (Port 8080) → Backend Services
 
 The gateway routes incoming requests to configured services based on URL patterns and applies middleware in a configurable order.
 
+## Testing & Verification
+
+This isn't just a spec — every feature below was run and verified end-to-end locally.
+
+**Routing + authentication:**
+```bash
+curl -H "X-API-KEY: abc-123" http://localhost:8080/users
+# → Hello from the backend-1 running on port 8083
+
+curl http://localhost:8080/users
+# → Authentication Failed
+```
+Confirmed: valid keys route through to a real backend; missing keys are correctly rejected.
+
+**Round-robin load balancing** — 6 consecutive requests, alternating cleanly across the two configured backends:
+```bash
+for i in {1..6}; do curl -H "X-API-KEY: abc-123" http://localhost:8080/users; echo; done
+```
+```
+Hello from the backend-1 running on port 8083
+Hello from the backend-1 running on port 8081
+Hello from the backend-1 running on port 8083
+Hello from the backend-1 running on port 8081
+Hello from the backend-1 running on port 8083
+Hello from the backend-1 running on port 8081
+```
+Confirmed: the atomic counter in `NewProxy()` correctly cycles through backends in order.
+
+**Rate limiter under real concurrent load** — 1000 requests fired with 100 concurrent workers (`xargs -P 100`), against a configured limit of 200 rps / 400 burst:
+```bash
+seq 1 1000 | xargs -P 100 -I {} curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "X-API-KEY: abc-123" http://localhost:8080/users | sort | uniq -c
+```
+```
+ 662 200
+ 338 429
+```
+Confirmed: the mutex-protected token bucket correctly allowed ~662 requests through and rejected ~338 with `429 Too Many Requests` once burst capacity was exceeded — verifying it's safe under genuine concurrent access, not just sequential requests (a sequential 500-request test with no concurrency, by contrast, produced all `200`s, since the bucket had time to refill between requests — a useful reminder that rate limiters need to be tested concurrently to actually exercise their logic).
+
 ## Features
 
 ### Middleware Stack
@@ -33,14 +72,14 @@ The gateway routes incoming requests to configured services based on URL pattern
    - Configurable valid keys in `config.yaml`
 
 2. **Rate Limiting** (`rate_limit`)
-   - Token bucket implementation
+   - Token bucket implementation, protected by a `sync.Mutex` per client/service key
    - Per-client rate limiting (by API key or IP)
    - Configurable requests per second and burst capacity
 
 3. **Circuit Breaker** (`circuit_breaker`)
-   - Three states: Closed, Open, Half-Open
-   - Automatic recovery after configured timeout
-   - Protects backends from overload
+   - Three states: Closed, Open, Half-Open — implemented as an explicit state machine
+   - Automatic recovery after configured timeout via a half-open probe request
+   - Protects backends from overload; opens after a configurable failure threshold
 
 4. **Metrics** (`metrics`)
    - HTTP request counter (method, status, service)
@@ -52,7 +91,7 @@ The gateway routes incoming requests to configured services based on URL pattern
 ### Load Balancing
 
 - Round-robin distribution across configured backend URLs
-- Atomic counter ensures thread-safe load distribution
+- Implemented with `atomic.AddUint64`, not a mutex — a lighter-weight primitive appropriate for a simple counter increment, avoiding lock contention under high request volume
 
 ### High Performance
 
@@ -70,7 +109,8 @@ The gateway routes incoming requests to configured services based on URL pattern
 
 1. **Clone the repository**
    ```bash
-   cd /home/adi/Downloads/apiGateway
+   git clone https://github.com/Mohdcode/api-Gateway.git
+   cd api-Gateway
    ```
 
 2. **Install dependencies**
@@ -273,6 +313,12 @@ wrk -t4 -c100 -d60s -H "X-API-KEY: abc-123" http://localhost:8080/users
 hey -n 10000 -c 100 -H "X-API-KEY: abc-123" http://localhost:8080/users
 ```
 
+Or the quick concurrent test used above, with no extra tools required:
+```bash
+seq 1 1000 | xargs -P 100 -I {} curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "X-API-KEY: abc-123" http://localhost:8080/users | sort | uniq -c
+```
+
 ## Project Structure
 
 ```
@@ -367,9 +413,12 @@ middleware:
   - Idle connection: 90s
   - TLS handshake: 10s
   - Response header: 30s
-- **Concurrency**: Uses atomic operations and sync.Map for thread safety
+- **Concurrency**: Rate limiting uses a `sync.Mutex`-protected token bucket per client; load balancing uses `atomic.AddUint64` for the round-robin counter; `sync.Map` stores per-client rate limiters safely across concurrent goroutines
 - **Memory**: Consider adjusting connection pool sizes for your workload
 
+## Why I built this
+
+I wanted hands-on experience with the core reliability patterns used in real production API gateways — rate limiting, circuit breaking, and load balancing — and to understand Go's concurrency primitives (mutexes, atomics, sync.Map) by applying them to genuine shared-state problems, rather than just reading about them.
 
 ## Contributing
 
@@ -382,7 +431,7 @@ Contributions are welcome! Please:
 
 ## Author
 
-Built with ❤️ using Go
+Built by [Mohd Kamaal](https://github.com/Mohdcode)
 
 ## Support
 
