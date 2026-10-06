@@ -6,11 +6,11 @@ A high-performance API Gateway built in Go with middleware support for authentic
 
 This project implements a production-ready API Gateway that sits between clients and backend services. It provides:
 
-- **Load Balancing**: Distributes requests across multiple backend instances using round-robin algorithm
-- **API Key Authentication**: Validates requests using API keys in `X-API-KEY` header
-- **Rate Limiting**: Token bucket algorithm to prevent service abuse (configurable per service)
-- **Circuit Breaker**: Protects backends from cascading failures with automatic recovery
-- **Metrics & Monitoring**: Prometheus metrics for request counting, latency tracking, and circuit breaker states
+- **JWT Authentication**: Supports Bearer tokens for secure, stateless authentication alongside API keys
+- **Distributed Rate Limiting**: Uses Redis with Lua scripts for atomic token bucket implementation across multiple gateway instances
+- **Distributed Circuit Breaker**: Shares service state in Redis to protect backends globally
+- **Least Connections Load Balancing**: Dynamically routes requests to the backend with the fewest active connections
+- **Health Checks**: Active background polling of `/health` endpoints to ensure traffic only hits healthy backends
 - **Profiling**: Built-in pprof support for performance analysis
 
 ## Architecture
@@ -67,19 +67,22 @@ Confirmed: the mutex-protected token bucket correctly allowed ~662 requests thro
 
 ### Middleware Stack
 
-1. **API Key Authentication** (`auth_apikey`)
-   - Validates API keys from request headers
-   - Configurable valid keys in `config.yaml`
+- **JWT Authentication** (`auth_apikey`)
+    - Supports both JWT (Bearer tokens) and API keys
+    - JWTs are validated using a configurable secret in `config.yaml`
+    - Fallback to API key validation if no valid JWT is provided
 
-2. **Rate Limiting** (`rate_limit`)
-   - Token bucket implementation, protected by a `sync.Mutex` per client/service key
-   - Per-client rate limiting (by API key or IP)
-   - Configurable requests per second and burst capacity
+2. **Distributed Rate Limiting** (`rate_limit`)
+    - Redis-backed token bucket implementation using Lua scripts for atomicity
+    - Ensures consistent rate limits across a cluster of gateway instances
+    - Per-client rate limiting (by API key or IP)
+    - Configurable requests per second and burst capacity
 
-3. **Circuit Breaker** (`circuit_breaker`)
-   - Three states: Closed, Open, Half-Open — implemented as an explicit state machine
-   - Automatic recovery after configured timeout via a half-open probe request
-   - Protects backends from overload; opens after a configurable failure threshold
+3. **Distributed Circuit Breaker** (`circuit_breaker`)
+    - Redis-backed state machine (Closed, Open, Half-Open)
+    - Shares backend failure state across all gateway nodes
+    - Automatic recovery after configured timeout via a half-open probe request
+    - Protects backends from overload; opens after a configurable failure threshold
 
 4. **Metrics** (`metrics`)
    - HTTP request counter (method, status, service)
@@ -88,10 +91,11 @@ Confirmed: the mutex-protected token bucket correctly allowed ~662 requests thro
    - Circuit breaker state gauge
    - Proxy cancellation counter
 
-### Load Balancing
-
-- Round-robin distribution across configured backend URLs
-- Implemented with `atomic.AddUint64`, not a mutex — a lighter-weight primitive appropriate for a simple counter increment, avoiding lock contention under high request volume
+### Load Balancing & Health
+ 
+ - **Least Connections**: Routes traffic to the backend with the fewest active connections, ensuring optimal resource utilization
+ - **Active Health Checks**: Background ticker polls `/health` endpoints every 10s; unhealthy backends are automatically removed from the load balancing pool
+ - Implemented with `atomic` operations to minimize lock contention under high request volume
 
 ### High Performance
 
@@ -102,7 +106,8 @@ Confirmed: the mutex-protected token bucket correctly allowed ~662 requests thro
 ## Prerequisites
 
 - **Go 1.25.4** or higher
-- **Prometheus** (optional, for metrics visualization)
+- **Redis** (Required for distributed rate limiting and circuit breaking)
+- **Prometheus** (Optional, for metrics visualization)
 - Basic understanding of HTTP and RESTful APIs
 
 ## Installation

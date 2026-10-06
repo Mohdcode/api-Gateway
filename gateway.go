@@ -16,8 +16,10 @@ import (
 
 	_ "net/http/pprof"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
 )
 
@@ -73,6 +75,7 @@ type Config struct {
 	Port             string      `yaml:"port"`
 	Services         []Service   `yaml:"services"`
 	MiddlewareConfig ConfigTypes `yaml:"middleware_config"`
+	JwtSecret        string      `yaml:"jwt_secret"`
 }
 type ConfigTypes struct {
 	ApiKeyAuth ApiConfig `yaml:"auth_apikey"`
@@ -88,6 +91,8 @@ type Service struct {
 	Middleware []string `yaml:"middleware"`
 	proxies    []*httputil.ReverseProxy
 	count      uint64
+	healthy    sync.Map // map[string]bool
+	activeConns sync.Map // map[string]*int64
 
 	// tuning values
 	RateLimitRPS          float64 `yaml:"rate_limit_rps"`
@@ -224,6 +229,8 @@ type Gateway struct {
 	rateLimiters    sync.Map
 	circuitBreakers map[string]*CircuitBreaker
 	transport       *http.Transport
+	rdb             *redis.Client
+	jwtSecret       string
 }
 
 func (g *Gateway) register(name string, wrapper MiddlewareWrapper) {
@@ -233,6 +240,22 @@ func (g *Gateway) register(name string, wrapper MiddlewareWrapper) {
 
 func (g *Gateway) authAPIKeyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Try JWT first
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+			
+			token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+				return []byte(g.jwtSecret), nil 
+			})
+
+			if err == nil && token.Valid {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// Fallback to API Key
 		apiKey := r.Header.Get("X-API-KEY")
 		if _, valid := g.apikeys[apiKey]; !valid {
 			log.Printf("Authentication failed, API KEY %s not found", apiKey)
@@ -288,24 +311,44 @@ func (g *Gateway) rateLimitMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		mapKey := key
+		mapKey := "rl:" + key
 		if service != nil {
-			mapKey = mapKey + "::" + service.Route
+			mapKey = mapKey + ":" + service.Route
 		}
 
-		val, ok := g.rateLimiters.Load(mapKey)
-		if !ok {
-			tb := NewTokenBucket(rate, burst)
-			g.rateLimiters.Store(mapKey, tb)
-			val = tb
-		}
-		tb := val.(*TokenBucket)
-		if !tb.TryConsume() {
+		ctx := r.Context()
+		now := time.Now().Unix()
+		
+		// Lua script for atomic Token Bucket in Redis
+		script := `
+		local key = KEYS[1]
+		local rate = tonumber(ARGV[1])
+		local capacity = tonumber(ARGV[2])
+		local now = tonumber(ARGV[3])
+		
+		local bucket = redis.call("HMGET", key, "tokens", "last")
+		local tokens = tonumber(bucket[1]) or capacity
+		local last = tonumber(bucket[2]) or now
+		
+		local elapsed = math.max(0, now - last)
+		tokens = math.min(capacity, tokens + (elapsed * rate))
+		
+		if tokens >= 1 then
+			tokens = tokens - 1
+			redis.call("HMSET", key, "tokens", tokens, "last", now)
+			return 1
+		else
+			return 0
+		end
+		`
+		
+		allowed, err := g.rdb.Eval(ctx, script, []string{mapKey}, rate, burst, now).Int()
+		if err != nil || allowed == 0 {
 			serviceName := "unknown"
 			if service != nil {
 				serviceName = service.Name
 			}
-			rateLimited.WithLabelValues(serviceName, "token_bucket").Inc()
+			rateLimited.WithLabelValues(serviceName, "redis_token_bucket").Inc()
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
@@ -320,29 +363,55 @@ func (g *Gateway) circuitBreakerMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		cb, ok := g.circuitBreakers[service.Route]
-		if !ok {
-			cb = NewCircuitBreaker(service.CBFailureThreshold, service.CBResetTimeoutSeconds)
-			g.circuitBreakers[service.Route] = cb
+		
+		cbKey := "cb:" + service.Route
+		ctx := r.Context()
+		
+		// Distributed state check in Redis
+		state, err := g.rdb.Get(ctx, cbKey).Int()
+		if err != nil {
+			state = int(CBClosed) // Default to closed if not found
 		}
-		cbState.WithLabelValues(service.Name).Set(float64(cb.State()))
+		
+		cbState.WithLabelValues(service.Name).Set(float64(state))
 
-		if !cb.AllowRequest() {
-			log.Printf("circuit open for service %s, rejecting request", service.Name)
-			http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
-			return
+		if state == int(CBOpen) {
+			// Check if timeout has passed to allow probe
+			lastFail, _ := g.rdb.Get(ctx, cbKey+":last").Time()
+			if time.Since(lastFail) < time.Duration(service.CBResetTimeoutSeconds)*time.Second {
+				log.Printf("circuit open for service %s, rejecting request", service.Name)
+				http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			// Transition to Half-Open for this request
+			state = int(CBHalfOpen)
 		}
+
 		rec := &statusRecorder{
 			ResponseWriter: w,
 			statusCode:     http.StatusOK,
 		}
 		next.ServeHTTP(rec, r)
+		
 		if rec.statusCode >= 500 {
-			cb.Report(false)
+			// Fail: Increment failures and potentially open circuit
+			fails, _ := g.rdb.Incr(ctx, cbKey+":fails").Result()
+			if fails >= int64(service.CBFailureThreshold) {
+				g.rdb.Set(ctx, cbKey, int(CBOpen), 0)
+				g.rdb.Set(ctx, cbKey+":last", time.Now(), 0)
+			}
+			// If we were half-open and failed, go back to open
+			if state == int(CBHalfOpen) {
+				g.rdb.Set(ctx, cbKey, int(CBOpen), 0)
+				g.rdb.Set(ctx, cbKey+":last", time.Now(), 0)
+			}
 		} else {
-			cb.Report(true)
+			// Success: Close circuit and reset failures
+			g.rdb.Set(ctx, cbKey, int(CBClosed), 0)
+			g.rdb.Del(ctx, cbKey+":fails")
 		}
-		cbState.WithLabelValues(service.Name).Set(float64(cb.State()))
+		
+		cbState.WithLabelValues(service.Name).Set(float64(state))
 	})
 }
 
@@ -356,12 +425,21 @@ func NewGateway(cfg *Config) *Gateway {
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
 	gw := &Gateway{
 		Ser:             make(map[string]*Service),
 		wrappers:        make(map[string]MiddlewareWrapper),
 		apikeys:         make(map[string]bool),
 		circuitBreakers: make(map[string]*CircuitBreaker),
 		transport:       sharedTransport,
+		rdb:             rdb,
+		jwtSecret:       cfg.JwtSecret,
+	}
+	if gw.jwtSecret == "" {
+		gw.jwtSecret = "default_secret_key"
 	}
 	for _, key := range cfg.MiddlewareConfig.ApiKeyAuth.ValidKeys {
 		gw.apikeys[key] = true
@@ -394,10 +472,15 @@ func NewGateway(cfg *Config) *Gateway {
 				http.Error(rw, "bad gateway", http.StatusBadGateway)
 			}
 			currSer.proxies = append(currSer.proxies, proxy)
+			currSer.healthy.Store(currSer.Urls[j], true) // Assume healthy initially
+			
+			var connCount int64
+			currSer.activeConns.Store(currSer.Urls[j], &connCount)
 		}
 		gw.Ser[currSer.Route] = currSer
 	}
 
+	gw.startHealthChecks()
 	return gw
 }
 
@@ -410,10 +493,87 @@ func (g *Gateway) findService(r *http.Request) *Service {
 	return nil
 }
 
+func (g *Gateway) startHealthChecks() {
+	ticker := time.NewTicker(10 * time.Second)
+	go func() {
+		for range ticker.C {
+			for _, service := range g.Ser {
+				for _, url := range service.Urls {
+					go func(s *Service, targetUrl string) {
+						client := http.Client{Timeout: 2 * time.Second}
+						resp, err := client.Get(targetUrl + "/health")
+						if err != nil || resp.StatusCode != http.StatusOK {
+							s.healthy.Store(targetUrl, false)
+							log.Printf("Health check failed for %s at %s", s.Name, targetUrl)
+						} else {
+							s.healthy.Store(targetUrl, true)
+						}
+						if resp != nil {
+							resp.Body.Close()
+						}
+					}(service, url)
+				}
+			}
+		}
+	}()
+}
+
 func (s *Service) NewProxy() *httputil.ReverseProxy {
-	newVal := atomic.AddUint64(&s.count, 1)
-	index := int(newVal % uint64(len(s.proxies)))
-	return s.proxies[index]
+	// Implement Least Connections Load Balancing
+	var bestProxyIndex = -1
+	var minConns int64 = -1
+
+	numProxies := len(s.proxies)
+	for i := 0; i < numProxies; i++ {
+		targetUrl := s.Urls[i]
+		
+		// Only consider healthy backends
+		if val, ok := s.healthy.Load(targetUrl); ok && val.(bool) == false {
+			continue
+		}
+
+		if connsVal, ok := s.activeConns.Load(targetUrl); ok {
+			conns := atomic.LoadInt64(connsVal.(*int64))
+			if minConns == -1 || conns < minConns {
+				minConns = conns
+				bestProxyIndex = i
+			}
+		}
+	}
+
+	if bestProxyIndex == -1 {
+		// Fallback to first proxy if all unhealthy or error
+		return s.proxies[0]
+	}
+
+	return s.proxies[bestProxyIndex]
+}
+
+// Wrapper to track active connections
+func (g *Gateway) trackConnections(service *Service, proxy *httputil.ReverseProxy) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetUrl := ""
+		// Find which URL this proxy corresponds to (simplified for this implementation)
+		// In a full implementation, the proxy would be wrapped in a struct containing its URL
+		for i, p := range service.proxies {
+			if p == proxy {
+				targetUrl = service.Urls[i]
+				break
+			}
+		}
+
+		if targetUrl == "" {
+			proxy.ServeHTTP(w, r)
+			return
+		}
+
+		if connsVal, ok := service.activeConns.Load(targetUrl); ok {
+			atomic.AddInt64(connsVal.(*int64), 1)
+			defer atomic.AddInt64(connsVal.(*int64), -1)
+		}
+
+		proxy.ServeHTTP(w, r)
+	})
 }
 
 func (g *Gateway) handleGateway(w http.ResponseWriter, r *http.Request) {
@@ -424,7 +584,9 @@ func (g *Gateway) handleGateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var curr http.Handler = service.NewProxy()
+	proxy := service.NewProxy()
+	var curr http.Handler = g.trackConnections(service, proxy)
+	
 	for i := len(service.Middleware) - 1; i >= 0; i-- {
 		middlewareName := service.Middleware[i]
 		middleware, ok := g.wrappers[middlewareName]
@@ -437,6 +599,65 @@ func (g *Gateway) handleGateway(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("forwarding the request of %s path to the service %s with %d middlewares", r.URL.Path, service.Name, len(service.Middleware))
 	curr.ServeHTTP(w, r)
+}
+
+func (g *Gateway) reloadConfig(path string) {
+	newCfg := loadConfigPath(path)
+	if newCfg == nil {
+		log.Println("Failed to reload config, keeping old configuration")
+		return
+	}
+
+	log.Println("Reloading configuration...")
+
+	// Update API Keys
+	newKeys := make(map[string]bool)
+	for _, key := range newCfg.MiddlewareConfig.ApiKeyAuth.ValidKeys {
+		newKeys[key] = true
+	}
+	g.apikeys = newKeys
+
+	// Update Services
+	for route, service := range g.Ser {
+		var found *Service
+		for i := range newCfg.Services {
+			if newCfg.Services[i].Route == route {
+				found = &newCfg.Services[i]
+				break
+			}
+		}
+
+		if found != nil {
+			service.RateLimitRPS = found.RateLimitRPS
+			service.RateLimitBurst = found.RateLimitBurst
+			service.CBFailureThreshold = found.CBFailureThreshold
+			service.CBResetTimeoutSeconds = found.CBResetTimeoutSeconds
+			service.Middleware = found.Middleware
+		}
+	}
+	log.Println("Configuration reloaded successfully")
+}
+
+func (g *Gateway) watchConfig(path string) {
+	go func() {
+		var lastMod time.Time
+		for {
+			info, err := os.Stat(path)
+			if err != nil {
+				log.Printf("Error stating config file: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			if info.ModTime().After(lastMod) {
+				if !lastMod.IsZero() {
+					g.reloadConfig(path)
+				}
+				lastMod = info.ModTime()
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}()
 }
 
 func loadConfigPath(p string) *Config {
@@ -467,6 +688,7 @@ func main() {
 	if gw == nil {
 		log.Fatal("failed to initialize gateway")
 	}
+	gw.watchConfig(configPath)
 	mux := http.NewServeMux()
 	mux.Handle("/", http.HandlerFunc(gw.handleGateway))
 	mux.Handle("/metrics", promhttp.Handler())
