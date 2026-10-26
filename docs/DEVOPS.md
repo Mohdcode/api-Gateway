@@ -180,12 +180,12 @@ deployment test:
 
 ```bash
 make ci                 # formatting, vet, lint, race/coverage tests, config validation, builds
-make kind-e2e           # deploy to an isolated kind cluster and run smoke checks
-make kind-e2e-down      # delete the test cluster when finished
+make cd                 # deploy to an isolated kind cluster and run smoke checks
+make cd-down            # delete the test cluster when finished
 ```
 
 `make ci` requires Go, Docker, kubectl, yamllint, and golangci-lint. It does not
-create a cluster. `make kind-e2e` tests deployment locally; it is not a run of
+create a cluster. `make cd` tests deployment locally; it is not a run of
 the remote GitHub `deploy` workflow.
 
 ### GitHub Actions

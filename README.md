@@ -174,7 +174,8 @@ publishing to GHCR.
 Run the main CI checks locally with `make ci` (requires Go, Docker, kubectl,
 yamllint, and golangci-lint). This does not create a Kubernetes cluster. To
 separately test deployment to a disposable local kind cluster, use
-`make kind-e2e`; remove that cluster afterward with `make kind-e2e-down`.
+`make cd`; remove that cluster afterward with `make cd-down`. These are local
+commands and do not run the remote GitHub deployment workflow.
 
 ## Configuration
 
@@ -384,7 +385,7 @@ or replace the regular `api-gateway` cluster. Run `make kind-e2e-down` to
 delete only that test cluster.
 
 For a clear local CI/CD split, run `make ci` for code, config, and image-build
-checks, then `make kind-e2e` for the Kubernetes deployment and smoke test.
+checks, then `make cd` for the Kubernetes deployment and smoke test.
 The kind test validates deployment but does not run the remote GitHub `deploy`
 workflow or leave a hosted environment running.
 
