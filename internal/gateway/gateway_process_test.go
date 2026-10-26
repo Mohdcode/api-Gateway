@@ -1,4 +1,4 @@
-package main
+package gateway
 
 import (
 	"bytes"
@@ -24,7 +24,7 @@ func TestProcessLifecycle(t *testing.T) {
 
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "gateway")
-	build := exec.Command("go", "build", "-o", binary, ".")
+	build := exec.Command("go", "build", "-o", binary, "../../cmd/gateway")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, output)
 	}

@@ -14,14 +14,14 @@ DOCKER_BUILD_FLAGS ?=
 GATEWAY_IMAGE := $(REGISTRY)/api-gateway:$(TAG)
 BACKEND_IMAGES := $(REGISTRY)/api-gateway-backend-1:$(TAG) $(REGISTRY)/api-gateway-backend-2:$(TAG) $(REGISTRY)/api-gateway-backend-3:$(TAG)
 
-.PHONY: help fmt fmt-check validate-devops vet lint test cover build clean \
+.PHONY: help fmt fmt-check validate-devops vet lint test cover build ci cd cd-down clean \
 	docker-build docker-push docker-backends compose-up compose-down compose-logs \
 	kind-up kind-down deploy monitoring smoke kind-e2e kind-e2e-down \
 	tf-fmt tf-init tf-validate tf-apply tf-destroy \
 	ansible-deploy ansible-lint
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
 fmt: ## Format Go code
 	gofmt -w .
@@ -60,7 +60,13 @@ cover: ## Run tests with a coverage report
 
 build: ## Build the gateway binary into bin/
 	mkdir -p bin
-	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/gateway .
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/gateway ./cmd/gateway
+
+ci: fmt-check vet lint cover validate-devops build docker-build ## Run the main CI checks locally (requires golangci-lint and Docker)
+
+cd: kind-e2e ## Deploy to a disposable local kind cluster and run smoke checks
+
+cd-down: kind-e2e-down ## Delete the disposable local deployment test cluster
 
 clean: ## Remove local build and coverage artifacts
 	rm -rf bin coverage.out
@@ -103,7 +109,11 @@ kind-e2e: ## Full local end-to-end on an isolated cluster (E2E_CLUSTER_NAME=api-
 	$(MAKE) CLUSTER_NAME=$(E2E_CLUSTER_NAME) INGRESS_HTTP_HOST_PORT=$(INGRESS_HTTP_HOST_PORT) INGRESS_HTTPS_HOST_PORT=$(INGRESS_HTTPS_HOST_PORT) kind-up
 	$(MAKE) CLUSTER_NAME=$(E2E_CLUSTER_NAME) OVERLAY=$(OVERLAY) TAG=$(TAG) REGISTRY=$(REGISTRY) DOCKER_BUILD_FLAGS="$(DOCKER_BUILD_FLAGS)" deploy
 	$(MAKE) CLUSTER_NAME=$(E2E_CLUSTER_NAME) smoke
-	curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused -H 'Host: gateway.local' -H 'X-API-KEY: abc-123' http://127.0.0.1:$(INGRESS_HTTP_HOST_PORT)/users
+	api_key="$$(kubectl -n api-gateway get secret gateway-secrets -o jsonpath='{.data.api-keys}' | openssl base64 -d -A | cut -d, -f1)"; \
+	test -n "$$api_key"; \
+	curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused \
+		-H 'Host: gateway.local' -H "X-API-KEY: $$api_key" \
+		http://127.0.0.1:$(INGRESS_HTTP_HOST_PORT)/users
 	@echo
 
 kind-e2e-down: ## Delete only the isolated end-to-end test cluster

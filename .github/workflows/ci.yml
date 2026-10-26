@@ -102,8 +102,8 @@ jobs:
       - name: build gateway binary
         run: |
           CGO_ENABLED=0 go build -trimpath \
-            -ldflags "-s -w -X main.version=${GITHUB_SHA::7} -X main.commit=${GITHUB_SHA}" \
-            -o bin/gateway .
+            -ldflags "-s -w -X github.com/Mohdcode/api-Gateway/internal/gateway.version=${GITHUB_SHA::7} -X github.com/Mohdcode/api-Gateway/internal/gateway.commit=${GITHUB_SHA}" \
+            -o bin/gateway ./cmd/gateway
 
       - name: upload binary
         uses: actions/upload-artifact@v4

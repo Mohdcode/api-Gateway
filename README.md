@@ -108,16 +108,16 @@ redis-server --daemonize yes
 ### 2. Start the backends
 
 ```bash
-go run ./backend1   # :8081
-go run ./backend2   # :8082
-go run ./backend3   # :8083
+go run ./cmd/backend1   # :8081
+go run ./cmd/backend2   # :8082
+go run ./cmd/backend3   # :8083
 ```
 
 ### 3. Start the gateway
 
 ```bash
-go run .                       # uses ./config.yaml
-go run . /path/to/custom.yaml  # custom config
+go run ./cmd/gateway                       # uses ./config.yaml
+go run ./cmd/gateway /path/to/custom.yaml  # custom config
 ```
 
 ### 4. Make requests
@@ -170,6 +170,11 @@ cluster. Separate workflows cover CodeQL/govulncheck/Trivy, kind deployment and
 monitoring E2E, Dev Container build/tests, Terraform validation and disposable
 kind apply/destroy, Ansible lint plus disposable-host idempotence, and image
 publishing to GHCR.
+Run the main CI checks locally with `make ci` (requires Go, Docker, kubectl,
+yamllint, and golangci-lint). This does not create a Kubernetes cluster. To
+separately test deployment to a disposable local kind cluster, use
+`make cd`; remove that cluster afterward with `make cd-down`. These are local
+commands and do not run the remote GitHub deployment workflow.
 
 ## Configuration
 
@@ -322,16 +327,23 @@ numbers.
 
 ```
 .
-├── gateway.go                    # Gateway, middleware, Lua scripts, config reload
-├── gateway_*_test.go             # Unit, e2e, edge-case, ops and process tests
+├── cmd/
+│   ├── gateway/                  # Gateway executable entrypoint
+│   ├── backend1/                 # Demo backend executable
+│   ├── backend2/                 # Demo backend executable
+│   └── backend3/                 # Demo backend executable
+├── internal/gateway/             # Gateway implementation and tests
+│   ├── config.go                 # Config loading and environment overrides
+│   ├── middleware.go             # Auth, metrics, rate limit, circuit breaker
+│   ├── operations.go             # Health, readiness, version, metrics handlers
+│   ├── runtime.go                # Server lifecycle and health-check command
+│   ├── service.go                # Service setup, routing, backend health
+│   └── types.go                  # Gateway and configuration types
 ├── config.yaml                   # Example configuration
 ├── Dockerfile                    # Multi-stage distroless gateway image
 ├── Dockerfile.backend            # Demo backend image (BACKEND=backend1|2|3)
 ├── compose.yaml                  # Gateway + backends + Redis + Prometheus + Grafana
 ├── Makefile                      # Local, Docker, kind, Terraform, Ansible targets
-├── backend1/                     # Demo backend :8081 (incl. /health)
-├── backend2/                     # Demo backend :8082
-├── backend3/                     # Demo backend :8083
 ├── deploy/
 │   ├── docker/                   # Container config and Prometheus scrape config
 │   ├── kind/kind-config.yaml     # 3-node kind cluster with ingress ports
@@ -370,6 +382,11 @@ kubectl -n api-gateway port-forward svc/gateway 8080:8080
 `make kind-e2e` uses a separate `api-gateway-e2e` cluster so it does not reuse
 or replace the regular `api-gateway` cluster. Run `make kind-e2e-down` to
 delete only that test cluster.
+
+For a clear local CI/CD split, run `make ci` for code, config, and image-build
+checks, then `make cd` for the Kubernetes deployment and smoke test.
+The kind test validates deployment but does not run the remote GitHub `deploy`
+workflow or leave a hosted environment running.
 
 Overlays:
 
