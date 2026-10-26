@@ -14,14 +14,14 @@ DOCKER_BUILD_FLAGS ?=
 GATEWAY_IMAGE := $(REGISTRY)/api-gateway:$(TAG)
 BACKEND_IMAGES := $(REGISTRY)/api-gateway-backend-1:$(TAG) $(REGISTRY)/api-gateway-backend-2:$(TAG) $(REGISTRY)/api-gateway-backend-3:$(TAG)
 
-.PHONY: help fmt fmt-check validate-devops vet lint test cover build clean \
+.PHONY: help fmt fmt-check validate-devops vet lint test cover build ci clean \
 	docker-build docker-push docker-backends compose-up compose-down compose-logs \
 	kind-up kind-down deploy monitoring smoke kind-e2e kind-e2e-down \
 	tf-fmt tf-init tf-validate tf-apply tf-destroy \
 	ansible-deploy ansible-lint
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
 fmt: ## Format Go code
 	gofmt -w .
@@ -60,7 +60,9 @@ cover: ## Run tests with a coverage report
 
 build: ## Build the gateway binary into bin/
 	mkdir -p bin
-	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/gateway .
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/gateway ./cmd/gateway
+
+ci: fmt-check vet lint cover validate-devops build docker-build ## Run the main CI checks locally (requires golangci-lint and Docker)
 
 clean: ## Remove local build and coverage artifacts
 	rm -rf bin coverage.out
