@@ -493,8 +493,9 @@ uncomment the remote host example for a Linux VM.
 - The shipped Redis is a single-replica StatefulSet for local/kind use. Use a
   managed or HA Redis for production; rate limiting and circuit breaking fail
   open during a Redis outage.
-- The dev overlay contains a development-only Secret. The prod overlay requires
-  a pre-created Secret or an external secret manager.
+- The dev overlay generates random credentials on first deployment and keeps
+  them in the cluster Secret. The prod overlay requires a pre-created Secret
+  or an external secret manager.
 
 ## Contributing
 
