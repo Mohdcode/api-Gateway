@@ -170,7 +170,6 @@ cluster. Separate workflows cover CodeQL/govulncheck/Trivy, kind deployment and
 monitoring E2E, Dev Container build/tests, Terraform validation and disposable
 kind apply/destroy, Ansible lint plus disposable-host idempotence, and image
 publishing to GHCR.
-
 Run the main CI checks locally with `make ci` (requires Go, Docker, kubectl,
 yamllint, and golangci-lint). This does not create a Kubernetes cluster. To
 separately test deployment to a disposable local kind cluster, use
