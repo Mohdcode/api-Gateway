@@ -1,0 +1,31 @@
+port: ":8080"
+
+# Overridden by JWT_SECRET in the container environment.
+jwt_secret: "dev-secret-change-me"
+
+redis:
+  # Overridden by REDIS_ADDR / REDIS_PASSWORD in the container environment.
+  addr: "redis:6379"
+  password: ""
+  db: 0
+
+middleware_config:
+  auth_apikey:
+    valid_keys: []
+
+services:
+  - name: users
+    route_pattern: "/users"
+    urls:
+      - "http://backend-1:8081"
+      - "http://backend-2:8082"
+      - "http://backend-3:8083"
+    middleware:
+      - "metrics"
+      - "auth_apikey"
+      - "rate_limit"
+      - "circuit_breaker"
+    rate_limit_rps: 200
+    rate_limit_burst: 400
+    cb_failure_threshold: 6
+    cb_reset_timeout_seconds: 15

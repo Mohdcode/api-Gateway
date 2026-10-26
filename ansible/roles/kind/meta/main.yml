@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  role_name: kind
+  author: Mohd Kamaal
+  description: Install the kind CLI used to run the local Kubernetes cluster.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions: [bookworm, trixie]
+    - name: Ubuntu
+      versions: [jammy, noble]
+    - name: EL
+      versions: ["9"]
+  galaxy_tags: [kubernetes, kind, api-gateway, devops]
+
+dependencies: []

@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  role_name: kubernetes_tools
+  author: Mohd Kamaal
+  description: Install kubectl and Helm.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions: [bookworm, trixie]
+    - name: Ubuntu
+      versions: [jammy, noble]
+    - name: EL
+      versions: ["9"]
+  galaxy_tags: [kubernetes, helm, api-gateway, devops]
+
+dependencies: []

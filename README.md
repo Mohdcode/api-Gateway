@@ -1,446 +1,510 @@
-# API Gateway
+# API Gateway (Go)
 
-A high-performance API Gateway built in Go with middleware support for authentication, rate limiting, circuit breaking, load balancing, and Prometheus metrics.
-
-## Overview
-
-This project implements a production-ready API Gateway that sits between clients and backend services. It provides:
-
-- **JWT Authentication**: Supports Bearer tokens for secure, stateless authentication alongside API keys
-- **Distributed Rate Limiting**: Uses Redis with Lua scripts for atomic token bucket implementation across multiple gateway instances
-- **Distributed Circuit Breaker**: Shares service state in Redis to protect backends globally
-- **Least Connections Load Balancing**: Dynamically routes requests to the backend with the fewest active connections
-- **Health Checks**: Active background polling of `/health` endpoints to ensure traffic only hits healthy backends
-- **Profiling**: Built-in pprof support for performance analysis
-
-## Architecture
+A config-driven HTTP API gateway with distributed rate limiting, a distributed
+circuit breaker, least-connections load balancing, active health checks,
+Prometheus metrics, pprof profiling, and hot config reload.
 
 ```
-Client → API Gateway (Port 8080) → Backend Services
-                                   ├─ Backend 1 (Port 8081)
-                                   ├─ Backend 2 (Port 8082)
-                                   └─ Backend 3 (Port 8083)
+Client -> API Gateway (:8080) -> Backend 1 (:8081)
+                              -> Backend 2 (:8082)
+                              -> Backend 3 (:8083)
 ```
-
-The gateway routes incoming requests to configured services based on URL patterns and applies middleware in a configurable order.
-
-## Testing & Verification
-
-This isn't just a spec — every feature below was run and verified end-to-end locally.
-
-**Routing + authentication:**
-```bash
-curl -H "X-API-KEY: abc-123" http://localhost:8080/users
-# → Hello from the backend-1 running on port 8083
-
-curl http://localhost:8080/users
-# → Authentication Failed
-```
-Confirmed: valid keys route through to a real backend; missing keys are correctly rejected.
-
-**Round-robin load balancing** — 6 consecutive requests, alternating cleanly across the two configured backends:
-```bash
-for i in {1..6}; do curl -H "X-API-KEY: abc-123" http://localhost:8080/users; echo; done
-```
-```
-Hello from the backend-1 running on port 8083
-Hello from the backend-1 running on port 8081
-Hello from the backend-1 running on port 8083
-Hello from the backend-1 running on port 8081
-Hello from the backend-1 running on port 8083
-Hello from the backend-1 running on port 8081
-```
-Confirmed: the atomic counter in `NewProxy()` correctly cycles through backends in order.
-
-**Rate limiter under real concurrent load** — 1000 requests fired with 100 concurrent workers (`xargs -P 100`), against a configured limit of 200 rps / 400 burst:
-```bash
-seq 1 1000 | xargs -P 100 -I {} curl -s -o /dev/null -w "%{http_code}\n" \
-  -H "X-API-KEY: abc-123" http://localhost:8080/users | sort | uniq -c
-```
-```
- 662 200
- 338 429
-```
-Confirmed: the mutex-protected token bucket correctly allowed ~662 requests through and rejected ~338 with `429 Too Many Requests` once burst capacity was exceeded — verifying it's safe under genuine concurrent access, not just sequential requests (a sequential 500-request test with no concurrency, by contrast, produced all `200`s, since the bucket had time to refill between requests — a useful reminder that rate limiters need to be tested concurrently to actually exercise their logic).
 
 ## Features
 
-### Middleware Stack
+- **Authentication** — API keys (`X-API-KEY`) or JWT Bearer tokens. JWTs are
+  pinned to **HS256**; other algorithms are rejected. Invalid bearer tokens can
+  fall back to a valid API key.
+- **Distributed rate limiting** — Redis-backed token bucket implemented in a Lua
+  script, so the limit is enforced atomically across every gateway instance.
+  Millisecond refill, per-identity/per-route buckets, and a TTL on every key.
+  Client identities use keyed HMAC-SHA-256 hashes, so raw API keys are never
+  written to Redis and hashes cannot be precomputed without the JWT signing
+  secret. Fails **open** if Redis is unavailable and increments
+  `gateway_rate_limited_total{reason="redis_error"}`.
+- **Distributed circuit breaker** — Redis-backed state machine (closed / open /
+  half-open) with atomic Lua transitions and a single in-flight probe when
+  half-open. Configurable failure threshold and reset timeout. Fails open on
+  Redis errors.
+- **Least-connections load balancing** — routes to the healthy backend with the
+  fewest active connections; ties rotate round-robin so equally loaded backends
+  share traffic. Unhealthy backends are skipped; if none remain the gateway
+  returns `503`.
+- **Active health checks** — polls each backend's `/health` every 10s and only
+  logs when a backend changes state.
+- **Observability** — Prometheus counters, histograms and gauges, plus pprof on
+  `:6060`.
+- **Hot config reload** — watches `config.yaml`, validates the new file, and
+  atomically swaps the routing/auth snapshot. Added routes appear, removed routes
+  disappear, and an invalid file is rejected without disturbing the running
+  configuration.
+- **Operational endpoints** — `/healthz` (liveness), `/readyz` (readiness), and
+  `/version` (build metadata). `SIGTERM` triggers a graceful drain with a
+  configurable `SHUTDOWN_DELAY`, so Kubernetes removes the pod from endpoints
+  before connections are closed.
+- **Container-native** — multi-stage distroless images, non-root runtime,
+  read-only root filesystem, Docker Compose stack, Kustomize manifests, Helm
+  monitoring, Terraform, and Ansible.
+- **Connection pooling** — one shared transport with large idle pools and tuned
+  timeouts.
 
-- **JWT Authentication** (`auth_apikey`)
-    - Supports both JWT (Bearer tokens) and API keys
-    - JWTs are validated using a configurable secret in `config.yaml`
-    - Fallback to API key validation if no valid JWT is provided
+## Request flow
 
-2. **Distributed Rate Limiting** (`rate_limit`)
-    - Redis-backed token bucket implementation using Lua scripts for atomicity
-    - Ensures consistent rate limits across a cluster of gateway instances
-    - Per-client rate limiting (by API key or IP)
-    - Configurable requests per second and burst capacity
+Middleware is applied in the order listed in `config.yaml`, where the **first
+entry is the outermost wrapper**. The shipped configuration is:
 
-3. **Distributed Circuit Breaker** (`circuit_breaker`)
-    - Redis-backed state machine (Closed, Open, Half-Open)
-    - Shares backend failure state across all gateway nodes
-    - Automatic recovery after configured timeout via a half-open probe request
-    - Protects backends from overload; opens after a configurable failure threshold
+```
+metrics -> auth_apikey -> rate_limit -> circuit_breaker -> least-conn proxy
+```
 
-4. **Metrics** (`metrics`)
-   - HTTP request counter (method, status, service)
-   - Request duration histogram
-   - Rate limit rejection counter
-   - Circuit breaker state gauge
-   - Proxy cancellation counter
+Putting `metrics` first means rejected requests (`401`, `429`, `503`) are counted
+too. Only after all middleware allows a request does the gateway pick a backend,
+so unauthenticated callers cannot observe backend health.
 
-### Load Balancing & Health
- 
- - **Least Connections**: Routes traffic to the backend with the fewest active connections, ensuring optimal resource utilization
- - **Active Health Checks**: Background ticker polls `/health` endpoints every 10s; unhealthy backends are automatically removed from the load balancing pool
- - Implemented with `atomic` operations to minimize lock contention under high request volume
+## Requirements
 
-### High Performance
+- **Go 1.26+** (see `go.mod`)
+- **Redis** — required for distributed rate limiting and circuit breaking; the
+  gateway still starts and serves traffic (fail-open) if Redis is down
+- **Prometheus** — optional
+- `curl` for the examples below
+- **Deployment (optional):** Docker + Docker Compose, `kubectl`, `kind`,
+  `helm`; `terraform` and `ansible-playbook` for the infrastructure paths
 
-- Shared HTTP transport with connection pooling
-- Configurable connection limits (20,000 max idle, 5,000 per host)
-- Optimized timeouts for TLS, idle connections, and response headers
+For a reproducible Linux-based toolchain, open this repository with
+[the Dev Container](docs/DEVCONTAINER.md). It installs the development and
+DevOps CLIs but does not provision infrastructure automatically.
 
-## Prerequisites
+## Docker Compose (fastest)
 
-- **Go 1.25.4** or higher
-- **Redis** (Required for distributed rate limiting and circuit breaking)
-- **Prometheus** (Optional, for metrics visualization)
-- Basic understanding of HTTP and RESTful APIs
+Runs the gateway, three backends, Redis, Prometheus, and Grafana with health
+checks and a provisioned dashboard:
 
-## Installation
+```bash
+export JWT_SECRET="$(openssl rand -hex 32)"
+export API_KEYS="$(openssl rand -hex 32)"
+export REDIS_PASSWORD="$(openssl rand -hex 32)"
+export GF_SECURITY_ADMIN_PASSWORD="$(openssl rand -hex 32)"
+docker compose up -d --build
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/Mohdcode/api-Gateway.git
-   cd api-Gateway
-   ```
+curl -H "X-API-KEY: ${API_KEYS%%,*}" http://localhost:8080/users
+open http://localhost:9090   # Prometheus
+open http://localhost:3000   # Grafana (admin / $GF_SECURITY_ADMIN_PASSWORD)
+```
 
-2. **Install dependencies**
-   ```bash
-   go mod download
-   ```
+Compose requires explicit credentials; generate fresh local-only values as
+shown above instead of relying on checked-in defaults.
 
-3. **Verify installation**
-   ```bash
-   go mod verify
-   ```
+## Quick start
+
+### 1. Start Redis
+
+```bash
+redis-server --daemonize yes
+# or: brew services start redis
+# or: docker run -d -p 6379:6379 redis:7
+```
+
+### 2. Start the backends
+
+```bash
+go run ./backend1   # :8081
+go run ./backend2   # :8082
+go run ./backend3   # :8083
+```
+
+### 3. Start the gateway
+
+```bash
+go run .                       # uses ./config.yaml
+go run . /path/to/custom.yaml  # custom config
+```
+
+### 4. Make requests
+
+```bash
+# API key
+curl -H "X-API-KEY: abc-123" http://localhost:8080/users
+
+# JWT (HS256, signed with jwt_secret from config.yaml)
+curl -H "Authorization: Bearer <token>" http://localhost:8080/users
+
+# Missing/invalid credentials
+curl http://localhost:8080/users          # -> 401 Authentication Failed
+```
+
+With the shipped config (`:8081` and `:8083` behind `/users`), six sequential
+requests alternate between the two backends because both report zero active
+connections:
+
+```
+Hello from the backend-1 running on port 8081
+Hello from the backend-3 running on port 8083
+Hello from the backend-1 running on port 8081
+...
+```
+
+## Testing
+
+The suite uses `miniredis` for Redis and `httptest` for backends, so it needs no
+external services:
+
+```bash
+go test ./...
+go test -race -count=1 -cover ./...
+```
+
+Current state: **46 test functions, ~83% statement coverage for the gateway
+package**, race-clean. Coverage includes a full-stack HTTP test that runs the
+shipped middleware chain and asserts the resulting Prometheus series, tests for
+auth, rate limiting, circuit breaking, load balancing, health checks, config
+reload, the new operational endpoints, env overrides, and the proxy error paths,
+plus a process-level test that builds the real binary and verifies
+`/healthz`, `-healthcheck`, and graceful shutdown on `SIGTERM`.
+
+`.github/workflows/ci.yml` runs deployment configuration validation, `gofmt`,
+`go vet`, `golangci-lint`, `go build`, and `go test -race -cover` on every push
+and pull request. Run `make validate-devops` locally to lint YAML, check shell
+syntax, validate Compose, and render the Kubernetes overlays without changing a
+cluster. Separate workflows cover CodeQL/govulncheck/Trivy, kind deployment and
+monitoring E2E, Dev Container build/tests, Terraform validation and disposable
+kind apply/destroy, Ansible lint plus disposable-host idempotence, and image
+publishing to GHCR.
 
 ## Configuration
-
-Edit `config.yaml` to configure the gateway:
 
 ```yaml
 port: ":8080"
 
-# API Key authentication configuration
+# Validates HS256 Bearer tokens. Change this in production.
+jwt_secret: "dev-secret-change-me"
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
 middleware_config:
   auth_apikey:
     valid_keys:
       - "abc-123"
       - "dwe-569"
 
-# Service definitions
 services:
   - name: users
     route_pattern: "/users"
     urls:
       - "http://localhost:8081"
       - "http://localhost:8083"
+
+    # First entry = outermost wrapper.
     middleware:
+      - "metrics"
       - "auth_apikey"
       - "rate_limit"
       - "circuit_breaker"
-      - "metrics"
-    
-    # Rate limiting configuration
-    rate_limit_rps: 200        # Requests per second
-    rate_limit_burst: 400      # Burst capacity
-    
-    # Circuit breaker configuration
-    cb_failure_threshold: 6              # Failures before opening circuit
-    cb_reset_timeout_seconds: 15         # Timeout before attempting recovery
-```
 
-### Configuration Parameters
+    rate_limit_rps: 200            # sustained tokens per second
+    rate_limit_burst: 400          # bucket capacity
+    cb_failure_threshold: 6        # consecutive 5xx before opening
+    cb_reset_timeout_seconds: 15   # open -> half-open delay
+```
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `port` | Gateway listening port | `:8080` |
-| `valid_keys` | List of valid API keys | - |
-| `route_pattern` | URL pattern to match | - |
-| `urls` | Backend service URLs | - |
-| `middleware` | Middleware stack (order matters) | - |
-| `rate_limit_rps` | Requests per second limit | 100 |
-| `rate_limit_burst` | Token bucket capacity | 200 |
-| `cb_failure_threshold` | Failures before circuit opens | 5 |
-| `cb_reset_timeout_seconds` | Circuit recovery timeout | 10 |
+| `port` | Listen address | `:8080` in the shipped config |
+| `jwt_secret` | HS256 signing secret | insecure `default_secret_key` (logged warning) |
+| `redis.addr` | Redis address | `localhost:6379` |
+| `redis.password` / `redis.db` | Redis auth / database | empty / `0` |
+| `valid_keys` | Accepted `X-API-KEY` values | none |
+| `route_pattern` | Path prefix (longest prefix wins) | required |
+| `urls` | Backend base URLs | required, at least one |
+| `middleware` | Middleware names, outermost first | none |
+| `rate_limit_rps` | Token refill rate | `100` |
+| `rate_limit_burst` | Bucket capacity | `200` |
+| `cb_failure_threshold` | Consecutive failures before opening | `5` |
+| `cb_reset_timeout_seconds` | Open-to-half-open delay | `10` |
 
-## Running the Project
+Available middleware names: `metrics`, `auth_apikey`, `rate_limit`,
+`circuit_breaker`.
 
-### 1. Start Backend Services
+### Environment overrides
 
-Open separate terminal windows for each backend:
+Environment variables take precedence over the config file, which is what the
+container and Kubernetes manifests use to inject secrets without baking them
+into a ConfigMap.
 
-**Backend 1:**
+| Variable | Overrides | Example |
+|----------|-----------|---------|
+| `CONFIG_PATH` | Config file path | `/etc/gateway/config.yaml` |
+| `PORT` | `port` | `:8080` |
+| `JWT_SECRET` | `jwt_secret` | random 32-byte hex |
+| `API_KEYS` | `valid_keys` (comma-separated) | `abc-123,dwe-569` |
+| `REDIS_ADDR` | `redis.addr` | `redis:6379` |
+| `REDIS_PASSWORD` | `redis.password` | from a Secret |
+| `REDIS_DB` | `redis.db` | `0` |
+| `PPROF_ADDR` | pprof listen address (`off` disables) | `:6060` |
+| `SHUTDOWN_DELAY` | delay before draining on `SIGTERM` | `5s` |
+| `HEALTHCHECK_ADDR` | address used by `-healthcheck` | `127.0.0.1:8080` |
+
+### Reload behavior
+
+The gateway checks the config file every 2 seconds and reloads when its
+modification time changes. A reload:
+
+- rebuilds the service set (new proxies, connection counters start at zero for
+  newly built backends),
+- replaces the API-key/JWT-secret snapshot,
+- rejects duplicate routes, missing URLs, and malformed YAML,
+- keeps the previous configuration if anything is invalid.
+
+In-flight requests finish on the old snapshot; new requests use the new one.
+
+## Metrics
+
+`GET /metrics` (Prometheus text format):
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `http_request_counter` | counter | `method`, `status`, `service` |
+| `http_request_timer` | histogram | `method`, `service` |
+| `gateway_rate_limited_total` | counter | `service`, `reason` (`token_bucket`, `redis_error`) |
+| `gateway_circuit_breaker_state` | gauge | `service` (`0` closed, `1` open, `2` half-open) |
+| `gateway_proxy_canceled_total` | counter | — |
+
+Scrape config is in `prometheus.yml` and alert rules are in
+`deploy/monitoring/alerts.yml`:
+
 ```bash
-cd backend1
-go run backend1.go
+docker run -d -p 9090:9090 \
+  -v "$(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml" \
+  -v "$(pwd)/deploy/monitoring/alerts.yml:/etc/prometheus/alerts.yml" \
+  prom/prometheus
 ```
 
-**Backend 2:**
-```bash
-cd backend2
-go run backend2.go
-```
+The Docker Compose and Kubernetes paths provision the same alerts plus a
+Grafana dashboard (`deploy/k8s/monitoring/grafana-dashboard.json`) with request
+rate, error rate, latency quantiles, throttling, and circuit-breaker panels.
 
-**Backend 3:**
-```bash
-cd backend3
-go run backend.go
-```
-
-### 2. Start the API Gateway
-
-```bash
-go run gateway.go
-```
-
-Or specify a custom config file:
-```bash
-go run gateway.go /path/to/custom-config.yaml
-```
-
-### 3. Test the Gateway
-
-**Basic request with API key:**
-```bash
-curl -H "X-API-KEY: abc-123" http://localhost:8080/users
-```
-
-**Expected response:**
-```
-Hello from the backend-1 running on port 8081
-```
-
-or
-
-```
-Hello from the backend-1 running on port 8083
-```
-
-(Alternates based on round-robin load balancing)
-
-**Without API key (will fail):**
-```bash
-curl http://localhost:8080/users
-```
-
-**Response:**
-```
-Authentication Failed
-```
-
-## Monitoring with Prometheus
-
-### 1. Start Prometheus
-
-If you have Docker:
-```bash
-docker run -d -p 9090:9090 -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus
-```
-
-Or install Prometheus locally and run:
-```bash
-prometheus --config.file=prometheus.yml
-```
-
-### 2. Access Prometheus
-
-Open your browser: `http://localhost:9090`
-
-### 3. Available Metrics
-
-- `http_request_counter` - Total HTTP requests (by method, status, service)
-- `http_request_timer` - Request duration histogram
-- `gateway_rate_limited_total` - Rate limited requests
-- `gateway_circuit_breaker_state` - Circuit breaker state (0=closed, 1=open, 2=half-open)
-- `gateway_proxy_canceled_total` - Client-canceled requests
-
-### Example Queries
+Useful queries:
 
 ```promql
-# Request rate per service
 rate(http_request_counter[1m])
-
-# 95th percentile latency
 histogram_quantile(0.95, rate(http_request_timer_bucket[5m]))
-
-# Rate limited requests
-sum(rate(gateway_rate_limited_total[1m])) by (service)
-
-# Circuit breaker state
+sum(rate(gateway_rate_limited_total[1m])) by (service, reason)
 gateway_circuit_breaker_state
 ```
 
+**Security note:** `/metrics` and pprof (`:6060`) are unauthenticated. Bind them
+to a private interface or put them behind your infrastructure's access controls.
+
 ## Profiling
 
-Access pprof endpoints at `http://localhost:6060/debug/pprof/`
-
-**CPU Profile:**
 ```bash
 go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
-```
-
-**Memory Profile:**
-```bash
 go tool pprof http://localhost:6060/debug/pprof/heap
-```
-
-**Goroutine Profile:**
-```bash
 go tool pprof http://localhost:6060/debug/pprof/goroutine
 ```
 
-## Load Testing
+## Load testing
 
-You can use tools like `wrk` or `hey` for load testing:
-
-**Using wrk:**
 ```bash
 wrk -t4 -c100 -d60s -H "X-API-KEY: abc-123" http://localhost:8080/users
 ```
 
-**Using hey:**
-```bash
-hey -n 10000 -c 100 -H "X-API-KEY: abc-123" http://localhost:8080/users
-```
+Note that the shipped config limits each identity to `200 rps` with a `400`
+burst, so a load test will mostly see `429`s. Raise `rate_limit_rps` /
+`rate_limit_burst` for throughput runs. `wrk_60s.txt` is a historical run from
+the author's machine (52k req/s); reproduce it yourself and expect different
+numbers.
 
-Or the quick concurrent test used above, with no extra tools required:
-```bash
-seq 1 1000 | xargs -P 100 -I {} curl -s -o /dev/null -w "%{http_code}\n" \
-  -H "X-API-KEY: abc-123" http://localhost:8080/users | sort | uniq -c
-```
-
-## Project Structure
+## Project structure
 
 ```
 .
-├── gateway.go              # Main gateway implementation
-├── config.yaml            # Gateway configuration
-├── go.mod                 # Go module dependencies
-├── prometheus.yml         # Prometheus configuration
-├── backend1/
-│   └── backend1.go       # Backend service 1 (port 8081)
-├── backend2/
-│   └── backend2.go       # Backend service 2 (port 8082)
-└── backend3/
-    └── backend.go        # Backend service 3 (port 8083)
+├── gateway.go                    # Gateway, middleware, Lua scripts, config reload
+├── gateway_*_test.go             # Unit, e2e, edge-case, ops and process tests
+├── config.yaml                   # Example configuration
+├── Dockerfile                    # Multi-stage distroless gateway image
+├── Dockerfile.backend            # Demo backend image (BACKEND=backend1|2|3)
+├── compose.yaml                  # Gateway + backends + Redis + Prometheus + Grafana
+├── Makefile                      # Local, Docker, kind, Terraform, Ansible targets
+├── backend1/                     # Demo backend :8081 (incl. /health)
+├── backend2/                     # Demo backend :8082
+├── backend3/                     # Demo backend :8083
+├── deploy/
+│   ├── docker/                   # Container config and Prometheus scrape config
+│   ├── kind/kind-config.yaml     # 3-node kind cluster with ingress ports
+│   ├── k8s/base/                 # Kustomize base (gateway, backends, Redis, HPA, PDB, policies)
+│   ├── k8s/overlays/dev|prod/    # Environment overlays (replicas, images, resources)
+│   ├── k8s/monitoring/           # ServiceMonitor, PrometheusRule, Grafana dashboard
+│   └── monitoring/               # Standalone Prometheus alerts + Grafana provisioning
+├── scripts/                      # kind up/down, deploy, smoke test
+├── terraform/                    # kind cluster + ingress/metrics/monitoring addons
+├── ansible/                      # Host provisioning + deployment roles
+├── prometheus.yml                # Standalone Prometheus scrape config
+├── .github/workflows/            # CI, security, e2e, image publish, deploy, IaC
+└── go.mod / go.sum
 ```
 
-## Development
+## Deployment (DevOps)
 
-### Adding New Services
+### Kubernetes with kind
 
-1. Add service configuration to `config.yaml`:
-   ```yaml
-   services:
-     - name: products
-       route_pattern: "/products"
-       urls:
-         - "http://localhost:9001"
-       middleware:
-         - "auth_apikey"
-         - "rate_limit"
-         - "circuit_breaker"
-         - "metrics"
-   ```
-
-2. Start your backend service on the configured port
-
-3. Restart the gateway to load new configuration
-
-### Creating Custom Middleware
-
-Add your middleware function in `gateway.go`:
-
-```go
-func (g *Gateway) customMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        // Your logic here
-        next.ServeHTTP(w, r)
-    })
-}
+```bash
+make kind-up     # 3-node kind cluster, ingress-nginx, metrics-server
+make deploy      # build images, load them, apply the dev overlay
+make smoke       # port-forward and verify health, auth, proxying, metrics
+make monitoring  # deploy + kube-prometheus-stack + dashboard
+make kind-down   # delete the cluster
 ```
 
-Register it in `NewGateway()`:
-```go
-gw.register("custom", gw.customMiddleware)
+The kind ingress uses host ports `18080` and `18443` by default. Add
+`gateway.local` to `/etc/hosts` (`127.0.0.1 gateway.local`) and use
+`curl -H "X-API-KEY: abc-123" http://gateway.local:18080/users`, or port-forward:
+
+```bash
+kubectl -n api-gateway port-forward svc/gateway 8080:8080
 ```
 
-Use it in `config.yaml`:
-```yaml
-middleware:
-  - "custom"
+`make kind-e2e` uses a separate `api-gateway-e2e` cluster so it does not reuse
+or replace the regular `api-gateway` cluster. Run `make kind-e2e-down` to
+delete only that test cluster.
+
+Overlays:
+
+| Overlay | Replicas | Image tags | Notes |
+|---------|----------|------------|-------|
+| `dev` | 1 gateway, 1 per backend | `dev` | Generates a random Secret during deployment |
+| `prod` | 3 gateway, 2 per backend | immutable version or SHA tag | Requires a pre-created Secret, larger resources, HPA 3–10 |
+
+Production secrets are intentionally **not** committed. Create them before a
+`prod` deploy (or use External Secrets / Sealed Secrets / SOPS):
+
+```bash
+kubectl create namespace api-gateway
+kubectl -n api-gateway create secret generic gateway-secrets \
+  --from-literal=jwt-secret="$(openssl rand -hex 32)" \
+  --from-literal=api-keys="$(openssl rand -hex 16)" \
+  --from-literal=redis-password="$(openssl rand -hex 24)"
 ```
+
+The gateway needs no cloud credentials. The manifests include a non-root,
+read-only-root security context, Restricted Pod Security labels, NetworkPolicies,
+HPA, PDB, rolling updates, startup/readiness/liveness probes, and a Redis
+StatefulSet with a PVC. See [`docs/DEVOPS.md`](docs/DEVOPS.md) for the full
+runbook.
+
+Use [`docs/MANUAL_TEST_CHECKLIST.md`](docs/MANUAL_TEST_CHECKLIST.md) to
+manually verify backend behavior, Compose, kind, monitoring, and optional
+Terraform, Ansible, and GitHub Actions paths.
+
+### CI/CD workflows
+
+| Workflow | Trigger | What it does |
+|----------|---------|--------------|
+| `ci.yml` | push, PR | deployment config validation, gofmt, vet, golangci-lint, race tests + coverage, build, Docker build |
+| `security.yml` | push, PR, weekly | CodeQL, govulncheck, Trivy SARIF, gitleaks |
+| `e2e-kind.yml` | push, PR | kind cluster → deploy → smoke, Prometheus scrape, Grafana health |
+| `devcontainer.yml` | relevant paths, PR | build Dev Container, run Go tests and DevOps validation in Linux |
+| `docker-publish.yml` | main, `v*` tags | multi-arch GHCR images, SBOM/provenance, Trivy image scan |
+| `deploy.yml` | successful image publish, manual | automatically deploys `main` to staging and version tags to production; supports manual deployment, applies secrets/manifests, waits for rollout, and smoke tests |
+| `terraform.yml` | `terraform/**` | `fmt -check`, `init`, `validate`, tflint |
+| `terraform-kind.yml` | Terraform/deploy paths, PR | apply to disposable kind, API/ingress smoke, targeted destroy |
+| `ansible.yml` | `ansible/**` | yamllint, syntax check, ansible-lint |
+| `ansible-idempotence.yml` | Ansible/deploy paths, PR | provision disposable Linux runner twice using its Docker daemon; assert second run has zero changes |
+
+Image tags: `main` produces `latest`, `dev` and `sha-<sha>`; a `vX.Y.Z` tag also
+produces `stable` and semver tags. Deploy by immutable `sha-<commit>` or
+semantic-version tag rather than mutable `dev`, `latest`, or `stable` tags.
+After a successful image publish, `main` deploys its immutable `sha-<commit>`
+image to `staging`, while a `vX.Y.Z` tag deploys the same immutable SHA image
+to `production`. Configure each GitHub `staging` and `production` environment
+with `KUBE_CONFIG`; `production` also needs `GATEWAY_JWT_SECRET`,
+`GATEWAY_API_KEYS`, and `GATEWAY_REDIS_PASSWORD`. The workflow selects
+`staging` for the dev overlay and `production` for the prod overlay. Protect the
+`production` environment with required reviewers and deployment branch rules.
+GHCR images must be public or the target cluster must already be able to pull
+them. Manual deployment remains available from the Actions tab.
+
+### Terraform
+
+`terraform/` creates a kind cluster, ingress-nginx, metrics-server, optionally
+kube-prometheus-stack, then builds/loads the app images and applies the chosen
+overlay:
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+terraform init
+terraform apply
+
+terraform destroy
+```
+
+### Ansible
+
+`ansible/` provisions Docker, kind, kubectl, Helm, then copies the project,
+builds images, deploys into kind, installs monitoring, and runs the smoke test:
+
+```bash
+ansible-playbook -i ansible/inventory/hosts.ini ansible/site.yml
+ansible-playbook -i ansible/inventory/hosts.ini ansible/site.yml --tags deploy
+```
+
+Set `gateway_install_monitoring`, `gateway_overlay`, and `gateway_image_tag` in
+`ansible/group_vars/all.yml`. The default inventory deploys to localhost;
+uncomment the remote host example for a Linux VM.
 
 ## Troubleshooting
 
-### Gateway won't start
-- Check if port 8080 is already in use: `lsof -i :8080`
-- Verify `config.yaml` syntax is correct
-- Ensure all required fields are present in configuration
+- **Redis down** — the gateway logs a warning at startup and keeps serving;
+  rate limiting and circuit breaking fail open. If you prefer to reject traffic
+  during a Redis outage, change the policy in `rateLimitMiddleware` (the
+  `redis_error` metric makes the current behavior observable).
+- **429 responses** — the identity hit its bucket. Buckets are keyed by hashed
+  API key / JWT subject / client IP plus route; check `rate_limit_rps` and
+  `rate_limit_burst`.
+- **503 responses** — the circuit is open, or every backend for the route is
+  unhealthy. Check `gateway_circuit_breaker_state` and the backend `/health`
+  endpoints.
+- **502 responses** — the selected backend could not be reached; see the proxy
+  error in the logs.
+- **JWT rejected** — only HS256 is accepted, `exp` must be valid, and the secret
+  must match `jwt_secret`.
+- **Config change ignored** — reload runs every 2s and only on modification-time
+  changes; check the log for a validation error. The old config stays active.
+- **Port in use** — `lsof -i :8080`.
 
-### Authentication failures
-- Verify API key in request header: `X-API-KEY: abc-123`
-- Check that the key exists in `config.yaml` under `valid_keys`
+## Limitations
 
-### Rate limiting issues
-- Adjust `rate_limit_rps` and `rate_limit_burst` in service configuration
-- Rate limits are per-client (by API key or IP address)
-
-### Circuit breaker opening
-- Check backend service health
-- Review `cb_failure_threshold` and `cb_reset_timeout_seconds` settings
-- Monitor Prometheus metrics for backend errors
-
-### Backend connection errors
-- Ensure all backend services are running
-- Verify URLs in `config.yaml` match backend ports
-- Check firewall/network settings
-
-## Performance Considerations
-
-- **Connection Pooling**: Shared transport with 20K max idle connections
-- **Timeouts**: 
-  - Idle connection: 90s
-  - TLS handshake: 10s
-  - Response header: 30s
-- **Concurrency**: Rate limiting uses a `sync.Mutex`-protected token bucket per client; load balancing uses `atomic.AddUint64` for the round-robin counter; `sync.Map` stores per-client rate limiters safely across concurrent goroutines
-- **Memory**: Consider adjusting connection pool sizes for your workload
-
-## Why I built this
-
-I wanted hands-on experience with the core reliability patterns used in real production API gateways — rate limiting, circuit breaking, and load balancing — and to understand Go's concurrency primitives (mutexes, atomics, sync.Map) by applying them to genuine shared-state problems, rather than just reading about them.
+- Active-connection counts are per gateway instance; least-connections is a local
+  decision even though rate limiting and circuit breaking are shared in Redis.
+- Circuit-breaker state is tracked per route, not per individual backend.
+- JWTs are symmetric HS256 only; there is no JWKS/RS256 support.
+- The gateway does not terminate TLS; terminate it at the ingress, load balancer,
+  or service mesh.
+- `/metrics` and pprof have no authentication. In Kubernetes, pprof is not
+  exposed by the Service, and the Ingress routes only `/users`, so `/metrics` is
+  reachable only from inside the cluster (ServiceMonitor or port-forward). Add a
+  path to the Ingress when you add routes, and do not add `/metrics`. In Docker
+  Compose pprof binds to `127.0.0.1`. Restrict or disable pprof
+  (`PPROF_ADDR=off`) in production.
+- The shipped Redis is a single-replica StatefulSet for local/kind use. Use a
+  managed or HA Redis for production; rate limiting and circuit breaking fail
+  open during a Redis outage.
+- The dev overlay contains a development-only Secret. The prod overlay requires
+  a pre-created Secret or an external secret manager.
 
 ## Contributing
 
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
+1. Fork the repository.
+2. Create a feature branch.
+3. Make your changes.
+4. Run `make fmt-check vet lint test`, and validate manifests with
+   `kubectl kustomize deploy/k8s/overlays/dev`.
+5. Open a pull request.
 
 ## Author
 
-Built by [Mohd Kamaal](https://github.com/Mohdcode)
-
-## Support
-
-For issues, questions, or suggestions:
-- Check existing documentation
-- Review Prometheus metrics for insights
-- Enable debug logging for troubleshooting
+Built by [Mohd Kamaal](https://github.com/Mohdcode).

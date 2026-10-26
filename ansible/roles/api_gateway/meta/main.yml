@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  role_name: api_gateway
+  author: Mohd Kamaal
+  description: Copy the project, build images, deploy into kind, and smoke test.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions: [bookworm, trixie]
+    - name: Ubuntu
+      versions: [jammy, noble]
+    - name: EL
+      versions: ["9"]
+  galaxy_tags: [api-gateway, kubernetes, devops]
+
+dependencies: []

@@ -1,0 +1,69 @@
+{
+  "name": "API Gateway DevOps",
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "options": ["--network=host"]
+  },
+  "runArgs": ["--network=host", "--group-add=0"],
+  "containerEnv": {
+    "DOCKER_HOST": "unix:///var/run/docker-host.sock"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/go:1": {
+      "version": "1.27.3",
+      "installGoTools": true
+    },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": true,
+      "dockerDashComposeVersion": "v2",
+      "installDockerBuildx": true
+    },
+    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {
+      "version": "v1.37.0",
+      "helm": "latest",
+      "minikube": "none"
+    },
+    "ghcr.io/devcontainers/features/terraform:1": {
+      "version": "1.13.5",
+      "tflint": "latest"
+    },
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.12",
+      "installTools": false
+    }
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "forwardPorts": [8080, 3000, 6060, 9090],
+  "portsAttributes": {
+    "8080": {
+      "label": "API Gateway"
+    },
+    "3000": {
+      "label": "Grafana"
+    },
+    "6060": {
+      "label": "Gateway pprof (private)"
+    },
+    "9090": {
+      "label": "Prometheus"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.Go",
+        "hashicorp.terraform",
+        "ms-azuretools.vscode-docker",
+        "redhat.ansible",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        "go.useLanguageServer": true,
+        "yaml.validate": true
+      }
+    }
+  }
+}

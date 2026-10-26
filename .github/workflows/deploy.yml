@@ -1,0 +1,196 @@
+name: deploy
+
+on:
+  workflow_run:
+    workflows: ["docker-publish"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      overlay:
+        description: Kustomize overlay to deploy
+        type: choice
+        options: [prod, dev]
+        default: prod
+        required: true
+      image_tag:
+        description: Immutable image tag (sha-<commit> or a semantic version such as 1.2.3)
+        type: string
+        required: true
+
+concurrency:
+  group: deploy-${{ github.event_name == 'workflow_dispatch' && inputs.overlay || (github.event.workflow_run.head_branch == 'main' && 'staging' || 'production') }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  prepare:
+    name: select deployment target
+    if: >-
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main'
+      ) ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        (
+          github.event.workflow_run.head_branch == 'main' ||
+          startsWith(github.event.workflow_run.head_branch, 'v')
+        )
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.target.outputs.should_deploy }}
+      overlay: ${{ steps.target.outputs.overlay }}
+      image_tag: ${{ steps.target.outputs.image_tag }}
+      environment: ${{ steps.target.outputs.environment }}
+    steps:
+      - name: select overlay and immutable image tag
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_OVERLAY: ${{ inputs.overlay }}
+          MANUAL_IMAGE_TAG: ${{ inputs.image_tag }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            overlay="${MANUAL_OVERLAY}"
+            image_tag="${MANUAL_IMAGE_TAG}"
+          elif [[ "${SOURCE_BRANCH}" == "main" ]]; then
+            overlay=dev
+            image_tag="sha-${SOURCE_SHA}"
+          elif [[ "${SOURCE_BRANCH}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            overlay=prod
+            image_tag="sha-${SOURCE_SHA}"
+          elif [[ "${SOURCE_BRANCH}" == v* ]]; then
+            echo "Skipping deployment for non-stable version tag ${SOURCE_BRANCH}"
+            echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          else
+            echo "error: only main and semantic-version releases can trigger deployment" >&2
+            exit 1
+          fi
+
+          if [[ "${overlay}" != "dev" && "${overlay}" != "prod" ]]; then
+            echo "error: overlay must be dev or prod" >&2
+            exit 1
+          fi
+          if [[ ! "${image_tag}" =~ ^(sha-[0-9a-f]{7,40}|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "error: image tag must be sha-<commit> or a semantic version such as 1.2.3" >&2
+            exit 1
+          fi
+
+          environment=staging
+          if [[ "${overlay}" == "prod" ]]; then
+            environment=production
+          fi
+
+          printf 'should_deploy=true\n' >> "${GITHUB_OUTPUT}"
+          printf 'overlay=%s\n' "${overlay}" >> "${GITHUB_OUTPUT}"
+          printf 'image_tag=%s\n' "${image_tag}" >> "${GITHUB_OUTPUT}"
+          printf 'environment=%s\n' "${environment}" >> "${GITHUB_OUTPUT}"
+
+  deploy:
+    name: deploy ${{ needs.prepare.outputs.image_tag }} to ${{ needs.prepare.outputs.overlay }}
+    needs: prepare
+    if: needs.prepare.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.prepare.outputs.environment }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: resolve image owner
+        id: vars
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.1
+
+      - name: configure kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          if [[ -z "${KUBE_CONFIG}" ]]; then
+            echo "KUBE_CONFIG must be set in the selected GitHub environment" >&2
+            exit 1
+          fi
+          mkdir -p "$HOME/.kube"
+          umask 077
+          printf '%s' "$KUBE_CONFIG" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl version --client
+          kubectl cluster-info
+
+      - name: ensure application secret
+        env:
+          JWT_SECRET: ${{ secrets.GATEWAY_JWT_SECRET }}
+          API_KEYS: ${{ secrets.GATEWAY_API_KEYS }}
+          REDIS_PASSWORD: ${{ secrets.GATEWAY_REDIS_PASSWORD }}
+          OVERLAY: ${{ needs.prepare.outputs.overlay }}
+        run: |
+          kubectl create namespace api-gateway --dry-run=client -o yaml | kubectl apply -f -
+          if [[ "${OVERLAY}" == "prod" ]]; then
+            if [[ -z "${JWT_SECRET}" || -z "${API_KEYS}" || -z "${REDIS_PASSWORD}" ]]; then
+              echo "GATEWAY_JWT_SECRET, GATEWAY_API_KEYS and GATEWAY_REDIS_PASSWORD must be set in the production environment" >&2
+              exit 1
+            fi
+          elif kubectl -n api-gateway get secret gateway-secrets >/dev/null 2>&1; then
+            echo "using existing staging Secret api-gateway/gateway-secrets"
+            exit 0
+          else
+            JWT_SECRET="$(openssl rand -hex 32)"
+            API_KEYS="$(openssl rand -hex 32)"
+            REDIS_PASSWORD="$(openssl rand -hex 32)"
+          fi
+
+          kubectl -n api-gateway create secret generic gateway-secrets \
+            --from-literal=jwt-secret="${JWT_SECRET}" \
+            --from-literal=api-keys="${API_KEYS}" \
+            --from-literal=redis-password="${REDIS_PASSWORD}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: apply manifests
+        env:
+          OVERLAY: ${{ needs.prepare.outputs.overlay }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          OWNER: ${{ steps.vars.outputs.owner }}
+        run: |
+          kubectl apply -k "deploy/k8s/overlays/${OVERLAY}"
+          kubectl -n api-gateway set image deployment/gateway gateway="ghcr.io/${OWNER}/api-gateway:${IMAGE_TAG}"
+          for n in 1 2 3; do
+            kubectl -n api-gateway set image "deployment/backend-${n}" backend="ghcr.io/${OWNER}/api-gateway-backend-${n}:${IMAGE_TAG}"
+          done
+
+      - name: wait for rollouts
+        run: |
+          kubectl -n api-gateway rollout status statefulset/redis --timeout=180s
+          for n in 1 2 3; do
+            kubectl -n api-gateway rollout status "deployment/backend-${n}" --timeout=180s
+          done
+          kubectl -n api-gateway rollout status deployment/gateway --timeout=180s
+
+      - name: smoke test
+        env:
+          OVERLAY: ${{ needs.prepare.outputs.overlay }}
+          API_KEYS: ${{ secrets.GATEWAY_API_KEYS }}
+        run: |
+          api_key=""
+          if [[ "${OVERLAY}" == "prod" ]]; then
+            if [[ -z "${API_KEYS}" ]]; then
+              echo "GATEWAY_API_KEYS must be set in the production environment" >&2
+              exit 1
+            fi
+            api_key="${API_KEYS%%,*}"
+          fi
+          API_KEY="${api_key}" NAMESPACE=api-gateway ./scripts/smoke-test.sh

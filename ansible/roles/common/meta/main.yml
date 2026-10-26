@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  role_name: common
+  author: Mohd Kamaal
+  description: Install base packages required by the API gateway deployment.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions: [bookworm, trixie]
+    - name: Ubuntu
+      versions: [jammy, noble]
+    - name: EL
+      versions: ["9"]
+  galaxy_tags: [api-gateway, devops]
+
+dependencies: []

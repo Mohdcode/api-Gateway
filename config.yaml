@@ -1,4 +1,13 @@
 port: ":8080"
+
+# Used to validate Bearer tokens (HS256). Change this in production.
+jwt_secret: "dev-secret-change-me"
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
 middleware_config:
   auth_apikey:
     valid_keys:
@@ -11,11 +20,13 @@ services:
     urls:
       - "http://localhost:8081"
       - "http://localhost:8083"
+    # Order matters: the first entry is the outermost wrapper.
+    # metrics first means rejected requests (401/429/503) are counted too.
     middleware:
+      - "metrics"
       - "auth_apikey"
       - "rate_limit"
       - "circuit_breaker"
-      - "metrics"
     rate_limit_rps: 200
     rate_limit_burst: 400
     cb_failure_threshold: 6

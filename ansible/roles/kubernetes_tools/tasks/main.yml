@@ -1,0 +1,71 @@
+---
+- name: Map the host architecture for Kubernetes tooling
+  ansible.builtin.set_fact:
+    k8s_tool_arch: "{{ 'amd64' if ansible_architecture in ['x86_64', 'amd64'] else 'arm64' }}"
+
+- name: Look up the latest stable kubectl version
+  ansible.builtin.uri:
+    url: https://dl.k8s.io/release/stable.txt
+    return_content: true
+  register: kubectl_stable
+  changed_when: false
+  check_mode: false
+  when: kubectl_version | length == 0
+
+- name: Resolve the kubectl version to install
+  ansible.builtin.set_fact:
+    kubectl_effective_version: "{{ kubectl_version if kubectl_version | length > 0 else kubectl_stable.content | trim }}"
+
+- name: Install kubectl
+  ansible.builtin.get_url:
+    url: "https://dl.k8s.io/release/{{ kubectl_effective_version }}/bin/{{ ansible_system | lower }}/{{ k8s_tool_arch }}/kubectl"
+    dest: /usr/local/bin/kubectl
+    mode: "0755"
+    owner: root
+    group: root
+    force: false
+
+- name: Look up the latest Helm release
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/helm/helm/releases/latest
+    return_content: false
+  register: helm_release
+  changed_when: false
+  check_mode: false
+  when: helm_version | length == 0
+
+- name: Resolve the Helm version to install
+  ansible.builtin.set_fact:
+    helm_effective_version: "{{ helm_version if helm_version | length > 0 else helm_release.json.tag_name }}"
+
+- name: Download the Helm archive
+  ansible.builtin.get_url:
+    url: "https://get.helm.sh/helm-{{ helm_effective_version }}-{{ ansible_system | lower }}-{{ k8s_tool_arch }}.tar.gz"
+    dest: "/tmp/helm-{{ helm_effective_version }}-{{ ansible_system | lower }}-{{ k8s_tool_arch }}.tar.gz"
+    mode: "0644"
+    force: false
+
+- name: Extract the Helm archive
+  ansible.builtin.unarchive:
+    src: "/tmp/helm-{{ helm_effective_version }}-{{ ansible_system | lower }}-{{ k8s_tool_arch }}.tar.gz"
+    dest: /tmp
+    remote_src: true
+    creates: "/tmp/{{ ansible_system | lower }}-{{ k8s_tool_arch }}/helm"
+
+- name: Install the Helm binary
+  ansible.builtin.copy:
+    src: "/tmp/{{ ansible_system | lower }}-{{ k8s_tool_arch }}/helm"
+    dest: /usr/local/bin/helm
+    mode: "0755"
+    owner: root
+    group: root
+    remote_src: true
+    force: false
+
+- name: Verify kubectl
+  ansible.builtin.command: kubectl version --client
+  changed_when: false
+
+- name: Verify Helm
+  ansible.builtin.command: helm version
+  changed_when: false

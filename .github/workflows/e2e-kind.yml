@@ -1,0 +1,114 @@
+name: e2e-kind
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-kind-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: kind end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.17.1
+
+      - name: create kind cluster
+        uses: helm/kind-action@v1.15.1
+        with:
+          cluster_name: api-gateway
+          config: deploy/kind/kind-config.yaml
+          wait: 180s
+
+      - name: build, load and deploy
+        env:
+          CLUSTER_NAME: api-gateway
+          OVERLAY: dev
+          TAG: dev
+          REGISTRY: ghcr.io/mohdcode
+          INSTALL_MONITORING: "false"
+        run: ./scripts/deploy-kind.sh
+
+      - name: smoke test
+        run: ./scripts/smoke-test.sh
+
+      - name: install lightweight Kubernetes monitoring stack
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update prometheus-community
+          helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+            --namespace monitoring --create-namespace \
+            --version 92.13.1 --wait --timeout 10m \
+            --set alertmanager.enabled=false \
+            --set kubeEtcd.enabled=false \
+            --set kubeControllerManager.enabled=false \
+            --set kubeScheduler.enabled=false \
+            --set kubeProxy.enabled=false \
+            --set nodeExporter.enabled=false \
+            --set kubeStateMetrics.enabled=false \
+            --set grafana.resources.requests.cpu=50m \
+            --set grafana.resources.requests.memory=128Mi \
+            --set prometheus.prometheusSpec.resources.requests.cpu=100m \
+            --set prometheus.prometheusSpec.resources.requests.memory=256Mi \
+            --set prometheus.prometheusSpec.retention=1d
+          kubectl apply -k deploy/k8s/monitoring
+          kubectl -n monitoring rollout status deployment/kube-prometheus-stack-grafana --timeout=300s
+          kubectl -n monitoring rollout status statefulset/prometheus-kube-prometheus-stack-prometheus --timeout=300s
+
+      - name: verify Prometheus scrapes the gateway and Grafana is healthy
+        run: |
+          kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 19090:9090 >/tmp/prometheus-port-forward.log 2>&1 &
+          prometheus_pid=$!
+          kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 13000:80 >/tmp/grafana-port-forward.log 2>&1 &
+          grafana_pid=$!
+          trap 'kill "$prometheus_pid" "$grafana_pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:13000/api/health >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:13000/api/health
+
+          for _ in $(seq 1 60); do
+            result="$(curl -fsSG http://127.0.0.1:19090/api/v1/query \
+              --data-urlencode 'query=up{namespace="api-gateway"}' 2>/dev/null || true)"
+            if jq -e '.data.result | any(.[]; .value[1] == "1")' <<<"${result}" >/dev/null; then
+              echo "Prometheus reports the API Gateway target up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "error: Prometheus did not report an up API Gateway scrape target" >&2
+          cat /tmp/prometheus-port-forward.log /tmp/grafana-port-forward.log >&2
+          exit 1
+
+      - name: debug cluster state
+        if: failure()
+        run: |
+          kubectl get nodes -o wide
+          kubectl -n api-gateway get all
+          kubectl -n api-gateway describe pods || true
+          kubectl -n api-gateway logs deployment/gateway --tail=200 || true
+          kubectl -n api-gateway logs deployment/backend-1 --tail=100 || true
+          kubectl -n api-gateway logs deployment/backend-2 --tail=100 || true
+          kubectl -n api-gateway logs deployment/backend-3 --tail=100 || true
+          kubectl -n api-gateway logs statefulset/redis --tail=100 || true

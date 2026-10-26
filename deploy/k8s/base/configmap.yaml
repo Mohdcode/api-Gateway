@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: api-gateway
+  labels:
+    app.kubernetes.io/name: api-gateway
+    app.kubernetes.io/component: gateway
+data:
+  config.yaml: |
+    port: ":8080"
+
+    # JWT_SECRET, API_KEYS, REDIS_ADDR and REDIS_PASSWORD override these
+    # values from the Deployment environment.
+    jwt_secret: "change-me-in-production"
+
+    redis:
+      addr: "redis:6379"
+      password: ""
+      db: 0
+
+    middleware_config:
+      auth_apikey:
+        valid_keys: []
+
+    services:
+      - name: users
+        route_pattern: "/users"
+        urls:
+          - "http://backend-1:8081"
+          - "http://backend-2:8082"
+          - "http://backend-3:8083"
+        middleware:
+          - "metrics"
+          - "auth_apikey"
+          - "rate_limit"
+          - "circuit_breaker"
+        rate_limit_rps: 200
+        rate_limit_burst: 400
+        cb_failure_threshold: 6
+        cb_reset_timeout_seconds: 15
