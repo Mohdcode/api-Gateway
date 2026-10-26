@@ -1,7 +1,10 @@
 port: ":8080"
 
-# Used to validate Bearer tokens (HS256). Change this in production.
-jwt_secret: "dev-secret-change-me"
+# Required for HS256 verification and keyed client identity hashes.
+# Set JWT_SECRET to a fresh random value before starting the gateway.
+jwt_secret: ""
+jwt_issuer: ""
+jwt_audience: ""
 
 redis:
   addr: "localhost:6379"
@@ -10,9 +13,7 @@ redis:
 
 middleware_config:
   auth_apikey:
-    valid_keys:
-      - "abc-123"
-      - "dwe-569"
+    valid_keys: []
 
 services:
   - name: users

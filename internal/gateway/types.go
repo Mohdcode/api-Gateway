@@ -1,8 +1,13 @@
 package gateway
 
 import (
+	"bufio"
+	"context"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,9 +33,46 @@ func (rec *statusRecorder) Unwrap() http.ResponseWriter {
 	return rec.ResponseWriter
 }
 
+func (rec *statusRecorder) Flush() {
+	if !rec.wroteHeader {
+		rec.WriteHeader(http.StatusOK)
+	}
+	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (rec *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := rec.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	return h.Hijack()
+}
+
+func (rec *statusRecorder) Push(target string, opts *http.PushOptions) error {
+	p, ok := rec.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return p.Push(target, opts)
+}
+
+func (rec *statusRecorder) ReadFrom(r io.Reader) (int64, error) {
+	if !rec.wroteHeader {
+		rec.WriteHeader(http.StatusOK)
+	}
+	if rf, ok := rec.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(rec.ResponseWriter, r)
+}
+
 type Config struct {
 	Port             string      `yaml:"port"`
 	JwtSecret        string      `yaml:"jwt_secret"`
+	JwtIssuer        string      `yaml:"jwt_issuer"`
+	JwtAudience      string      `yaml:"jwt_audience"`
 	Redis            RedisConfig `yaml:"redis"`
 	Services         []Service   `yaml:"services"`
 	MiddlewareConfig ConfigTypes `yaml:"middleware_config"`
@@ -66,28 +108,44 @@ type Service struct {
 }
 
 type backend struct {
-	url     string
-	proxy   *httputil.ReverseProxy
-	conns   atomic.Int64
-	healthy atomic.Bool
+	url       string
+	healthURL string
+	proxy     *httputil.ReverseProxy
+	conns     atomic.Int64
+	healthy   atomic.Bool
+	checked   atomic.Bool
 }
 
 type MiddlewareWrapper func(next http.Handler) http.Handler
 
 type authConfig struct {
-	keys      map[string]bool
-	jwtSecret string
+	keys        map[string]bool
+	jwtSecret   string
+	jwtIssuer   string
+	jwtAudience string
+}
+
+type configSnapshot struct {
+	services map[string]*Service
+	auth     *authConfig
 }
 
 type Gateway struct {
-	services  atomic.Pointer[map[string]*Service]
-	auth      atomic.Pointer[authConfig]
-	wrappers  map[string]MiddlewareWrapper
-	transport *http.Transport
-	rdb       *redis.Client
-	now       func() time.Time
+	config       atomic.Pointer[configSnapshot]
+	wrappers     map[string]MiddlewareWrapper
+	transport    *http.Transport
+	rdb          *redis.Client
+	now          func() time.Time
+	probeTimeout time.Duration
+	workerCtx    context.Context
+	workerCancel context.CancelFunc
+	workerWG     sync.WaitGroup
+	closeOnce    sync.Once
+	closeErr     error
+	draining     atomic.Bool
 }
 
 type ctxKey string
 
 const identityKey ctxKey = "gateway.identity"
+const configSnapshotKey ctxKey = "gateway.config_snapshot"

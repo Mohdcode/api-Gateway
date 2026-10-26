@@ -1,7 +1,7 @@
 port: ":8080"
 
-# Overridden by JWT_SECRET in the container environment.
-jwt_secret: "dev-secret-change-me"
+# Required from JWT_SECRET in the container environment.
+jwt_secret: ""
 
 redis:
   # Overridden by REDIS_ADDR / REDIS_PASSWORD in the container environment.

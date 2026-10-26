@@ -32,6 +32,12 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("JWT_SECRET"); v != "" {
 		cfg.JwtSecret = v
 	}
+	if v := os.Getenv("JWT_ISSUER"); v != "" {
+		cfg.JwtIssuer = v
+	}
+	if v := os.Getenv("JWT_AUDIENCE"); v != "" {
+		cfg.JwtAudience = v
+	}
 	if v := os.Getenv("REDIS_ADDR"); v != "" {
 		cfg.Redis.Addr = v
 	}

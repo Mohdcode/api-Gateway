@@ -89,11 +89,11 @@ services:
     environment:
       - CONFIG_PATH=/etc/gateway/config.yaml
       - PORT=:8080
-      - PPROF_ADDR=:6060
-      - JWT_SECRET
-      - API_KEYS
+      - PPROF_ADDR=${PPROF_ADDR:-off}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      - API_KEYS=${API_KEYS:?API_KEYS is required}
       - REDIS_ADDR=redis:6379
-      - REDIS_PASSWORD
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:6060:6060"
@@ -144,7 +144,7 @@ services:
     restart: unless-stopped
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:?GF_SECURITY_ADMIN_PASSWORD is required}
       - GF_USERS_ALLOW_SIGN_UP=false
     ports:
       - "127.0.0.1:3000:3000"

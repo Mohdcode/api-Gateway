@@ -25,21 +25,6 @@ func Run(configPath string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pprofAddr := os.Getenv("PPROF_ADDR")
-	if pprofAddr == "" {
-		pprofAddr = ":6060"
-	}
-	var pprofServer *http.Server
-	if !strings.EqualFold(pprofAddr, "off") {
-		pprofServer = &http.Server{Addr: pprofAddr, ReadHeaderTimeout: 5 * time.Second}
-		go func() {
-			log.Printf("pprof listening on %s", pprofAddr)
-			if err := pprofServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("pprof server stopped: %v", err)
-			}
-		}()
-	}
-
 	if envConfigPath := os.Getenv("CONFIG_PATH"); envConfigPath != "" {
 		configPath = envConfigPath
 	} else if configPath == "" {
@@ -60,11 +45,29 @@ func Run(configPath string) int {
 	defer gw.Close()
 	gw.watchConfigWith(ctx, configPath, 2*time.Second)
 
+	pprofAddr := pprofAddress()
+	var pprofServer *http.Server
+	if !strings.EqualFold(pprofAddr, "off") {
+		pprofServer = &http.Server{Addr: pprofAddr, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			log.Printf("pprof listening on %s", pprofAddr)
+			if err := pprofServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("pprof server stopped: %v", err)
+			}
+		}()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = pprofServer.Shutdown(shutdownCtx)
+		}()
+	}
+
 	server := &http.Server{
 		Addr:              cfg.Port,
 		Handler:           gw.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	serverErr := make(chan error, 1)
@@ -74,6 +77,7 @@ func Run(configPath string) int {
 
 	select {
 	case <-ctx.Done():
+		gw.draining.Store(true)
 		if delay := shutdownDelay(); delay > 0 {
 			log.Printf("shutdown signal received, waiting %s before draining", delay)
 			time.Sleep(delay)
@@ -98,4 +102,11 @@ func Run(configPath string) int {
 		}
 		return 0
 	}
+}
+
+func pprofAddress() string {
+	if addr := strings.TrimSpace(os.Getenv("PPROF_ADDR")); addr != "" {
+		return addr
+	}
+	return "off"
 }

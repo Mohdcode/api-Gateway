@@ -56,16 +56,13 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
-            - name: pprof
-              containerPort: 6060
-              protocol: TCP
           env:
             - name: CONFIG_PATH
               value: /etc/gateway/config.yaml
             - name: PORT
               value: ":8080"
             - name: PPROF_ADDR
-              value: ":6060"
+              value: "off"
             - name: SHUTDOWN_DELAY
               value: 5s
             - name: JWT_SECRET

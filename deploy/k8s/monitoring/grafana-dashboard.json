@@ -99,9 +99,9 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
       "id": 8,
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "title": "Rate limited by reason",
+      "title": "Rate limited by service",
       "type": "timeseries",
-      "targets": [{ "expr": "sum(rate(gateway_rate_limited_total[5m])) by (service, reason)", "legendFormat": "{{service}} / {{reason}}", "refId": "A" }]
+      "targets": [{ "expr": "sum(rate(gateway_rate_limited_total[5m])) by (service)", "legendFormat": "{{service}}", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },

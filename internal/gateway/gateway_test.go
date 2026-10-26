@@ -13,6 +13,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -43,7 +44,7 @@ func testService(name, route string, urls []string, middleware ...string) Servic
 func testConfig(mr *miniredis.Miniredis, services ...Service) *Config {
 	return &Config{
 		Port:      ":0",
-		JwtSecret: "test-secret",
+		JwtSecret: "0123456789abcdef0123456789abcdef",
 		Redis:     RedisConfig{Addr: mr.Addr()},
 		MiddlewareConfig: ConfigTypes{
 			ApiKeyAuth: ApiConfig{ValidKeys: []string{"key-a", "key-b"}},
@@ -82,7 +83,7 @@ func TestFindServiceUsesLongestPrefix(t *testing.T) {
 	m := map[string]*Service{"/users": users, "/users/admin": admin, "/products": products}
 
 	g := &Gateway{}
-	g.services.Store(&m)
+	g.storeConfiguration(m, nil)
 
 	tests := []struct {
 		path string
@@ -90,6 +91,7 @@ func TestFindServiceUsesLongestPrefix(t *testing.T) {
 	}{
 		{"/users", users},
 		{"/users/42", users},
+		{"/usersXYZ", nil},
 		{"/users/admin", admin},
 		{"/users/admin/settings", admin},
 		{"/products/1", products},
@@ -170,7 +172,7 @@ func TestHandleGatewayReturns503WhenNoHealthyBackend(t *testing.T) {
 	backend.backends[0].healthy.Store(false)
 	m := map[string]*Service{"/test": backend}
 	g := &Gateway{}
-	g.services.Store(&m)
+	g.storeConfiguration(m, nil)
 
 	if rec := request(g, http.MethodGet, "/test", nil); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
@@ -179,7 +181,7 @@ func TestHandleGatewayReturns503WhenNoHealthyBackend(t *testing.T) {
 
 func TestAuthMiddleware(t *testing.T) {
 	g := &Gateway{}
-	g.auth.Store(&authConfig{
+	g.storeConfiguration(nil, &authConfig{
 		keys:      map[string]bool{"key-a": true},
 		jwtSecret: "test-secret",
 	})
@@ -211,6 +213,9 @@ func TestAuthMiddleware(t *testing.T) {
 		"sub": "user-1",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
+	missingExpirationJWT := signJWT(t, "test-secret", jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": "user-1",
+	})
 
 	tests := []struct {
 		name       string
@@ -223,9 +228,11 @@ func TestAuthMiddleware(t *testing.T) {
 		{"missing credentials", nil, http.StatusUnauthorized, ""},
 		{"valid jwt", map[string]string{"Authorization": "Bearer " + validJWT}, http.StatusOK, "jwt:user-1"},
 		{"expired jwt", map[string]string{"Authorization": "Bearer " + expiredJWT}, http.StatusUnauthorized, ""},
+		{"missing expiration", map[string]string{"Authorization": "Bearer " + missingExpirationJWT}, http.StatusUnauthorized, ""},
 		{"wrong secret", map[string]string{"Authorization": "Bearer " + wrongSecretJWT}, http.StatusUnauthorized, ""},
 		{"wrong algorithm", map[string]string{"Authorization": "Bearer " + wrongAlgJWT}, http.StatusUnauthorized, ""},
 		{"alg none", map[string]string{"Authorization": "Bearer " + noneJWT}, http.StatusUnauthorized, ""},
+		{"malformed bearer header", map[string]string{"Authorization": "Bearer"}, http.StatusUnauthorized, ""},
 		{"invalid jwt falls back to api key", map[string]string{"Authorization": "Bearer " + wrongSecretJWT, "X-API-KEY": "key-a"}, http.StatusOK, "key:" + hashSecret("key-a", "test-secret")},
 	}
 
@@ -243,6 +250,44 @@ func TestAuthMiddleware(t *testing.T) {
 			}
 			if tc.wantID != "" && identity != tc.wantID {
 				t.Fatalf("identity = %q, want %q", identity, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestAuthJWTValidatesConfiguredIssuerAndAudience(t *testing.T) {
+	const secret = "test-secret"
+	g := &Gateway{}
+	g.storeConfiguration(nil, &authConfig{jwtSecret: secret, jwtIssuer: "trusted-issuer", jwtAudience: "gateway-api"})
+	handler := g.authAPIKeyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	claims := func(issuer string, audience string) jwt.MapClaims {
+		return jwt.MapClaims{
+			"sub": "user-1",
+			"exp": time.Now().Add(time.Hour).Unix(),
+			"iss": issuer,
+			"aud": audience,
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		claims jwt.MapClaims
+		want   int
+	}{
+		{"valid issuer and audience", claims("trusted-issuer", "gateway-api"), http.StatusOK},
+		{"wrong issuer", claims("untrusted-issuer", "gateway-api"), http.StatusUnauthorized},
+		{"wrong audience", claims("trusted-issuer", "other-api"), http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := signJWT(t, secret, jwt.SigningMethodHS256, tc.claims)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
 			}
 		})
 	}
@@ -275,14 +320,16 @@ func TestRateLimiterRejectsBeyondBurstAndRefills(t *testing.T) {
 	svc.RateLimitBurst = 1
 	g := newTestGateway(t, testConfig(mr, svc))
 
-	now := time.Now()
-	g.now = func() time.Time { return now }
+	now := time.Now().UTC()
+	mr.SetTime(now)
 
 	if rec := request(g, http.MethodGet, "/users", nil); rec.Code != http.StatusOK {
 		t.Fatalf("first request status = %d, want 200", rec.Code)
 	}
 	if rec := request(g, http.MethodGet, "/users", nil); rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("second request status = %d, want 429", rec.Code)
+	} else if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1 second", got)
 	}
 
 	const bucketKey = "rl:ip:192.0.2.1:/users"
@@ -290,7 +337,7 @@ func TestRateLimiterRejectsBeyondBurstAndRefills(t *testing.T) {
 		t.Fatalf("rate limit key %q has no TTL (got %v)", bucketKey, ttl)
 	}
 
-	now = now.Add(2 * time.Second)
+	mr.SetTime(now.Add(2 * time.Second))
 	if rec := request(g, http.MethodGet, "/users", nil); rec.Code != http.StatusOK {
 		t.Fatalf("request after refill status = %d, want 200", rec.Code)
 	}
@@ -336,8 +383,12 @@ func TestRateLimiterFailsOpenWhenRedisIsDown(t *testing.T) {
 		DialTimeout: 50 * time.Millisecond,
 	})
 
+	before := testutil.ToFloat64(redisOperationErrors.WithLabelValues("users", "rate_limit"))
 	if rec := request(g, http.MethodGet, "/users", nil); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 when Redis is unavailable", rec.Code)
+	}
+	if got := testutil.ToFloat64(redisOperationErrors.WithLabelValues("users", "rate_limit")) - before; got != 1 {
+		t.Fatalf("Redis failure metric increment = %v, want 1", got)
 	}
 }
 
@@ -427,6 +478,132 @@ func TestCircuitBreakerFailsOpenWhenRedisIsDown(t *testing.T) {
 	}
 }
 
+func circuitBreakerTestKeys() []string {
+	return []string{"cb:/users:state", "cb:/users:fails", "cb:/users:last", "cb:/users:probe", "cb:/users:generation"}
+}
+
+func seedOpenCircuit(t *testing.T, g *Gateway, now time.Time) {
+	t.Helper()
+	g.now = func() time.Time { return now }
+	if _, err := g.rdb.Eval(context.Background(), cbReportScript, circuitBreakerTestKeys(),
+		1, 0, float64(now.UnixNano())/1e9, 0, 0, "").Result(); err != nil {
+		t.Fatalf("seed open circuit: %v", err)
+	}
+}
+
+func TestCircuitBreakerIgnoresLateClosedOutcomes(t *testing.T) {
+	mr := newTestRedis(t)
+	g := newTestGateway(t, testConfig(mr))
+	now := time.Unix(1_700_000_000, 0)
+	g.now = func() time.Time { return now }
+	allowKeys := []string{circuitBreakerTestKeys()[0], circuitBreakerTestKeys()[2], circuitBreakerTestKeys()[3], circuitBreakerTestKeys()[4]}
+	first, err := g.rdb.Eval(context.Background(), cbAllowScript, allowKeys, 1, float64(now.UnixNano())/1e9, cbProbeTTLMillis, "first").Int64Slice()
+	if err != nil || len(first) != 3 || first[0] != 0 || first[1] != 1 {
+		t.Fatalf("first closed admission = %v, %v", first, err)
+	}
+	second, err := g.rdb.Eval(context.Background(), cbAllowScript, allowKeys, 1, float64(now.UnixNano())/1e9, cbProbeTTLMillis, "second").Int64Slice()
+	if err != nil || len(second) != 3 || second[0] != 0 || second[1] != 1 || second[2] != first[2] {
+		t.Fatalf("second closed admission = %v, %v", second, err)
+	}
+
+	if _, err := g.rdb.Eval(context.Background(), cbReportScript, circuitBreakerTestKeys(),
+		1, 0, float64(now.UnixNano())/1e9, 0, first[2], "first").Result(); err != nil {
+		t.Fatalf("report threshold failure: %v", err)
+	}
+	for _, outcome := range []int64{1, 0} {
+		if _, err := g.rdb.Eval(context.Background(), cbReportScript, circuitBreakerTestKeys(),
+			1, outcome, float64(now.Add(time.Second).UnixNano())/1e9, 0, second[2], "second").Result(); err != nil {
+			t.Fatalf("report late closed outcome %d: %v", outcome, err)
+		}
+	}
+	if state := mustGet(t, mr, "cb:/users:state"); state != "1" {
+		t.Fatalf("state after late closed outcomes = %q, want open (1)", state)
+	}
+	if failures := mustGet(t, mr, "cb:/users:fails"); failures != "1" {
+		t.Fatalf("failure count after late closed outcomes = %q, want 1", failures)
+	}
+}
+
+func TestCircuitBreakerProbeReportRequiresCurrentOwner(t *testing.T) {
+	mr := newTestRedis(t)
+	g := newTestGateway(t, testConfig(mr))
+	now := time.Unix(1_700_000_000, 0)
+	seedOpenCircuit(t, g, now)
+	g.now = func() time.Time { return now.Add(2 * time.Second) }
+	allowKeys := []string{circuitBreakerTestKeys()[0], circuitBreakerTestKeys()[2], circuitBreakerTestKeys()[3], circuitBreakerTestKeys()[4]}
+	owner, err := g.rdb.Eval(context.Background(), cbAllowScript, allowKeys, 1,
+		float64(g.clock().UnixNano())/1e9, cbProbeTTLMillis, "owner-a").Int64Slice()
+	if err != nil || len(owner) != 3 || owner[0] != 2 || owner[1] != 1 {
+		t.Fatalf("probe admission = %v, %v", owner, err)
+	}
+	if _, err := g.rdb.Eval(context.Background(), cbReportScript, circuitBreakerTestKeys(),
+		1, 1, float64(g.clock().UnixNano())/1e9, 2, owner[2], "owner-b").Result(); err != nil {
+		t.Fatalf("report non-owner success: %v", err)
+	}
+	if state := mustGet(t, mr, "cb:/users:state"); state != "2" {
+		t.Fatalf("state after non-owner report = %q, want half-open (2)", state)
+	}
+	if token, err := mr.Get("cb:/users:probe"); err != nil || token != "owner-a" {
+		t.Fatalf("probe owner after non-owner report = %q, %v; want owner-a", token, err)
+	}
+
+	// Expiration recovers an abandoned lease; its late owner must not affect
+	// the replacement probe, even though both were admitted in the same epoch.
+	mr.FastForward(time.Duration(cbProbeTTLMillis+1) * time.Millisecond)
+	replacement, err := g.rdb.Eval(context.Background(), cbAllowScript, allowKeys, 1,
+		float64(g.clock().UnixNano())/1e9, cbProbeTTLMillis, "owner-b").Int64Slice()
+	if err != nil || len(replacement) != 3 || replacement[0] != 2 || replacement[1] != 1 || replacement[2] != owner[2] {
+		t.Fatalf("replacement probe admission = %v, %v", replacement, err)
+	}
+	if _, err := g.rdb.Eval(context.Background(), cbReportScript, circuitBreakerTestKeys(),
+		1, 1, float64(g.clock().UnixNano())/1e9, 2, owner[2], "owner-a").Result(); err != nil {
+		t.Fatalf("report expired owner: %v", err)
+	}
+	if state := mustGet(t, mr, "cb:/users:state"); state != "2" {
+		t.Fatalf("state after expired-owner report = %q, want half-open (2)", state)
+	}
+	if token, err := mr.Get("cb:/users:probe"); err != nil || token != "owner-b" {
+		t.Fatalf("replacement probe owner = %q, %v; want owner-b", token, err)
+	}
+	if _, err := g.rdb.Eval(context.Background(), cbReportScript, circuitBreakerTestKeys(),
+		1, 1, float64(g.clock().UnixNano())/1e9, 2, replacement[2], "owner-b").Result(); err != nil {
+		t.Fatalf("report current owner: %v", err)
+	}
+	if state := mustGet(t, mr, "cb:/users:state"); state != "0" {
+		t.Fatalf("state after current-owner success = %q, want closed (0)", state)
+	}
+}
+
+func TestCircuitBreakerProbeTimeoutReopensCircuit(t *testing.T) {
+	mr := newTestRedis(t)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer backend.Close()
+	svc := testService("users", "/users", []string{backend.URL}, "circuit_breaker")
+	svc.CBFailureThreshold = 1
+	svc.CBResetTimeoutSeconds = 1
+	g := newTestGateway(t, testConfig(mr, svc))
+	g.probeTimeout = 25 * time.Millisecond
+	now := time.Unix(1_700_000_000, 0)
+	seedOpenCircuit(t, g, now)
+	g.now = func() time.Time { return now.Add(2 * time.Second) }
+
+	if rec := request(g, http.MethodGet, "/users", nil); rec.Code != http.StatusBadGateway {
+		t.Fatalf("timed-out probe status = %d, want 502", rec.Code)
+	}
+	if state := mustGet(t, mr, "cb:/users:state"); state != "1" {
+		t.Fatalf("state after timed-out probe = %q, want open (1)", state)
+	}
+	if mr.Exists("cb:/users:probe") {
+		t.Fatal("timed-out probe must release its owned probe lock")
+	}
+}
+
 func TestCircuitBreakerAllowsOnlyOneProbe(t *testing.T) {
 	mr := newTestRedis(t)
 	svc := testService("users", "/users", []string{"http://127.0.0.1:1"}, "circuit_breaker")
@@ -436,30 +613,108 @@ func TestCircuitBreakerAllowsOnlyOneProbe(t *testing.T) {
 	g.now = func() time.Time { return time.Unix(1_700_000_000, 0) }
 
 	if _, err := g.rdb.Eval(context.Background(), cbReportScript,
-		[]string{"cb:/users:state", "cb:/users:fails", "cb:/users:last", "cb:/users:probe"},
-		1, 0, float64(g.clock().UnixNano())/1e9).Result(); err != nil {
+		[]string{"cb:/users:state", "cb:/users:fails", "cb:/users:last", "cb:/users:probe", "cb:/users:generation"},
+		1, 0, float64(g.clock().UnixNano())/1e9, 0, 0, "").Result(); err != nil {
 		t.Fatalf("seed failure: %v", err)
 	}
 	g.now = func() time.Time { return time.Unix(1_700_000_010, 0) }
 
 	first, err := g.rdb.Eval(context.Background(), cbAllowScript,
-		[]string{"cb:/users:state", "cb:/users:last", "cb:/users:probe"},
-		1, float64(g.clock().UnixNano())/1e9, cbProbeTTLMillis).Int64Slice()
+		[]string{"cb:/users:state", "cb:/users:last", "cb:/users:probe", "cb:/users:generation"},
+		1, float64(g.clock().UnixNano())/1e9, cbProbeTTLMillis, "probe-one").Int64Slice()
 	if err != nil {
 		t.Fatalf("first allow: %v", err)
 	}
-	if len(first) != 2 || first[0] != 2 || first[1] != 1 {
-		t.Fatalf("first allow = %v, want [2 1]", first)
+	if len(first) != 3 || first[0] != 2 || first[1] != 1 {
+		t.Fatalf("first allow = %v, want [2 1 generation]", first)
 	}
 
 	second, err := g.rdb.Eval(context.Background(), cbAllowScript,
-		[]string{"cb:/users:state", "cb:/users:last", "cb:/users:probe"},
-		1, float64(g.clock().UnixNano())/1e9, cbProbeTTLMillis).Int64Slice()
+		[]string{"cb:/users:state", "cb:/users:last", "cb:/users:probe", "cb:/users:generation"},
+		1, float64(g.clock().UnixNano())/1e9, cbProbeTTLMillis, "probe-two").Int64Slice()
 	if err != nil {
 		t.Fatalf("second allow: %v", err)
 	}
-	if len(second) != 2 || second[0] != 2 || second[1] != 0 {
-		t.Fatalf("second allow = %v, want [2 0] (probe already in flight)", second)
+	if len(second) != 3 || second[0] != 2 || second[1] != 0 {
+		t.Fatalf("second allow = %v, want [2 0 generation] (probe already in flight)", second)
+	}
+}
+
+func TestCircuitBreakerAllowsOnlyOneConcurrentProbe(t *testing.T) {
+	mr := newTestRedis(t)
+	var backendRequests atomic.Int32
+	probeEntered := make(chan struct{}, 16)
+	releaseProbe := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		backendRequests.Add(1)
+		probeEntered <- struct{}{}
+		<-releaseProbe
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	svc := testService("users", "/users", []string{backend.URL}, "circuit_breaker")
+	svc.CBFailureThreshold = 1
+	svc.CBResetTimeoutSeconds = 1
+	g := newTestGateway(t, testConfig(mr, svc))
+	openTime := time.Unix(1_700_000_000, 0)
+	g.now = func() time.Time { return openTime }
+	if _, err := g.rdb.Eval(context.Background(), cbReportScript,
+		[]string{"cb:/users:state", "cb:/users:fails", "cb:/users:last", "cb:/users:probe", "cb:/users:generation"},
+		1, 0, float64(g.clock().UnixNano())/1e9, 0, 0, "").Result(); err != nil {
+		t.Fatalf("seed open circuit: %v", err)
+	}
+	g.now = func() time.Time { return openTime.Add(2 * time.Second) }
+
+	const requests = 16
+	start := make(chan struct{})
+	statuses := make(chan int, requests)
+	for i := 0; i < requests; i++ {
+		go func() {
+			<-start
+			statuses <- request(g, http.MethodGet, "/users", nil).Code
+		}()
+	}
+	close(start)
+
+	select {
+	case <-probeEntered:
+	case <-time.After(5 * time.Second):
+		close(releaseProbe)
+		t.Fatal("no half-open probe reached the backend")
+	}
+
+	// Keep the winning probe in flight while all competing requests check the
+	// half-open state; they must be rejected instead of reaching the backend.
+	for i := 0; i < requests-1; i++ {
+		select {
+		case status := <-statuses:
+			if status != http.StatusServiceUnavailable {
+				close(releaseProbe)
+				t.Fatalf("competing request status = %d, want 503", status)
+			}
+		case <-time.After(5 * time.Second):
+			close(releaseProbe)
+			t.Fatal("timed out waiting for competing requests to be rejected")
+		}
+	}
+
+	close(releaseProbe)
+	select {
+	case status := <-statuses:
+		if status != http.StatusOK {
+			t.Fatalf("probe request status = %d, want 200", status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the probe response")
+	}
+
+	if got := backendRequests.Load(); got != 1 {
+		t.Fatalf("backend received %d probe requests, want exactly 1", got)
 	}
 }
 
@@ -476,17 +731,17 @@ func TestHealthCheckMarksBackendUnhealthyAndRecovers(t *testing.T) {
 	defer srv.Close()
 
 	svc := &Service{Name: "users"}
-	b := &backend{url: srv.URL}
+	b := &backend{url: srv.URL, healthURL: srv.URL + "/health"}
 	b.healthy.Store(true)
 	client := &http.Client{Timeout: time.Second}
 
-	checkBackend(client, svc, b)
+	checkBackend(context.Background(), context.Background(), client, svc, b)
 	if b.healthy.Load() {
 		t.Fatal("backend should be unhealthy after a 500 health response")
 	}
 
 	fail.Store(false)
-	checkBackend(client, svc, b)
+	checkBackend(context.Background(), context.Background(), client, svc, b)
 	if !b.healthy.Load() {
 		t.Fatal("backend should recover after a 200 health response")
 	}
@@ -514,7 +769,7 @@ func TestReloadConfigReplacesServicesAndKeys(t *testing.T) {
 	path := filepath.Join(dir, "config.yaml")
 	writeConfig(t, path, `
 port: ":0"
-jwt_secret: "test-secret"
+jwt_secret: "0123456789abcdef0123456789abcdef"
 redis:
   addr: "`+mr.Addr()+`"
 middleware_config:
@@ -535,13 +790,13 @@ services:
 		t.Fatalf("load initial config: %v", err)
 	}
 	g := newTestGateway(t, cfg)
-	if !g.auth.Load().keys["old-key"] {
+	if !g.config.Load().auth.keys["old-key"] {
 		t.Fatal("old key should be active after initial load")
 	}
 
 	writeConfig(t, path, `
 port: ":0"
-jwt_secret: "test-secret"
+jwt_secret: "0123456789abcdef0123456789abcdef"
 redis:
   addr: "`+mr.Addr()+`"
 middleware_config:
@@ -558,7 +813,7 @@ services:
 `)
 	g.reloadConfig(path)
 
-	auth := g.auth.Load()
+	auth := g.config.Load().auth
 	if auth.keys["old-key"] {
 		t.Fatal("old key should be gone after reload")
 	}
@@ -570,6 +825,23 @@ services:
 	}
 	if g.findService(httptest.NewRequest(http.MethodGet, "/users", nil)) != nil {
 		t.Fatal("removed service route should no longer be registered")
+	}
+
+	// A weak secret must not replace the currently working auth snapshot.
+	writeConfig(t, path, `
+jwt_secret: "short"
+services:
+  - name: replacement
+    route_pattern: "/replacement"
+    urls:
+      - "`+backend.URL+`"
+`)
+	g.reloadConfig(path)
+	if g.findService(httptest.NewRequest(http.MethodGet, "/products", nil)) == nil {
+		t.Fatal("weak-secret config must not replace the running services")
+	}
+	if !g.config.Load().auth.keys["new-key"] {
+		t.Fatal("weak-secret config must not replace the running auth config")
 	}
 
 	// An invalid update must be ignored rather than replacing working state.
@@ -611,6 +883,13 @@ func TestBuildServicesRejectsInvalidConfig(t *testing.T) {
 		{"no urls", &Config{Services: []Service{{Name: "x", Route: "/x"}}}},
 		{"no route", &Config{Services: []Service{{Name: "x", Urls: []string{"http://a"}}}}},
 		{"bad scheme", &Config{Services: []Service{{Name: "x", Route: "/x", Urls: []string{"ftp://a"}}}}},
+		{"route without leading slash", &Config{Services: []Service{{Name: "x", Route: "x", Urls: []string{"http://a"}}}}},
+		{"route trailing slash", &Config{Services: []Service{{Name: "x", Route: "/x/", Urls: []string{"http://a"}}}}},
+		{"negative rate", &Config{Services: []Service{{Name: "x", Route: "/x", Urls: []string{"http://a"}, RateLimitRPS: -1}}}},
+		{"negative circuit threshold", &Config{Services: []Service{{Name: "x", Route: "/x", Urls: []string{"http://a"}, CBFailureThreshold: -1}}}},
+		{"backend credentials", &Config{Services: []Service{{Name: "x", Route: "/x", Urls: []string{"http://user:secret@a"}}}}},
+		{"missing service name", &Config{Services: []Service{{Route: "/x", Urls: []string{"http://a"}}}}},
+		{"unknown middleware", &Config{Services: []Service{{Name: "x", Route: "/x", Urls: []string{"http://a"}, Middleware: []string{"auth_api_key"}}}}},
 		{"duplicate route", &Config{Services: []Service{
 			{Name: "x", Route: "/x", Urls: []string{"http://a"}},
 			{Name: "y", Route: "/x", Urls: []string{"http://b"}},

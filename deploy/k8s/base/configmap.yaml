@@ -12,7 +12,7 @@ data:
 
     # JWT_SECRET, API_KEYS, REDIS_ADDR and REDIS_PASSWORD override these
     # values from the Deployment environment.
-    jwt_secret: "change-me-in-production"
+    jwt_secret: ""
 
     redis:
       addr: "redis:6379"
