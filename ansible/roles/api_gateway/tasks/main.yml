@@ -1,0 +1,82 @@
+---
+- name: Ensure the deployment directory exists
+  ansible.builtin.file:
+    path: "{{ gateway_deploy_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Copy the project to the deployment host
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../"
+    dest: "{{ gateway_deploy_dir }}/"
+    mode: preserve
+
+- name: Make deployment scripts executable
+  ansible.builtin.file:
+    path: "{{ gateway_deploy_dir }}/scripts/{{ item }}"
+    mode: "0755"
+  loop:
+    - kind-up.sh
+    - kind-down.sh
+    - deploy-kind.sh
+    - smoke-test.sh
+
+- name: Create the kind cluster with ingress and metrics-server
+  ansible.builtin.command: "{{ gateway_deploy_dir }}/scripts/kind-up.sh"
+  args:
+    chdir: "{{ gateway_deploy_dir }}"
+  environment:
+    CLUSTER_NAME: "{{ kind_cluster_name }}"
+  register: kind_up
+  changed_when: "'creating kind cluster' in kind_up.stdout"
+
+- name: Ensure the application namespace exists
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - apply
+      - -f
+      - "{{ gateway_deploy_dir }}/deploy/k8s/base/namespace.yaml"
+  register: application_namespace
+  changed_when: "' created' in application_namespace.stdout or ' configured' in application_namespace.stdout"
+
+- name: Check whether application manifests need changes
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - diff
+      - -k
+      - "{{ gateway_deploy_dir }}/deploy/k8s/overlays/{{ gateway_overlay }}"
+  register: application_manifest_diff
+  changed_when: application_manifest_diff.rc == 1
+  failed_when: application_manifest_diff.rc > 1
+
+- name: Build images and deploy the API gateway stack
+  ansible.builtin.command: "{{ gateway_deploy_dir }}/scripts/deploy-kind.sh"
+  args:
+    chdir: "{{ gateway_deploy_dir }}"
+  environment:
+    CLUSTER_NAME: "{{ kind_cluster_name }}"
+    OVERLAY: "{{ gateway_overlay }}"
+    TAG: "{{ gateway_image_tag }}"
+    REGISTRY: "{{ gateway_registry }}"
+    INSTALL_MONITORING: "{{ gateway_install_monitoring | lower }}"
+  register: deploy_result
+  changed_when: "' image updated' in deploy_result.stdout"
+
+- name: Run the post-deploy smoke test
+  ansible.builtin.command: "{{ gateway_deploy_dir }}/scripts/smoke-test.sh"
+  args:
+    chdir: "{{ gateway_deploy_dir }}"
+  environment:
+    NAMESPACE: api-gateway
+  changed_when: false
+
+- name: Show the gateway endpoint
+  ansible.builtin.debug:
+    msg:
+      - "gateway:    http://gateway.local (Host header) or kubectl -n api-gateway port-forward svc/gateway 8080:8080"
+      - "prometheus: kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 9090:9090"
+      - "grafana:    kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80"

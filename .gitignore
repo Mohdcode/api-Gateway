@@ -1,0 +1,36 @@
+# Compiled binaries
+/gateway
+/gw
+/oldgw
+/bin/
+*.exe
+*.test
+*.out
+
+# Logs and coverage artifacts
+*.log
+coverage.*
+coverage.out
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform.lock.hcl.bak
+terraform/*.auto.tfvars
+!terraform/*.tfvars.example
+
+# Ansible
+ansible/*.retry
+ansible/inventory/*.local.ini
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

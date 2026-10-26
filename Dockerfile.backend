@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+# Build one demo backend per image: --build-arg BACKEND=backend1|backend2|backend3
+
+FROM golang:1.27-alpine AS build
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY . .
+
+ARG BACKEND=backend1
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/backend ./${BACKEND}
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+LABEL org.opencontainers.image.title="api-gateway-demo-backend" \
+      org.opencontainers.image.source="https://github.com/Mohdcode/api-Gateway"
+
+COPY --from=build /out/backend /backend
+
+USER nonroot:nonroot
+
+EXPOSE 8081 8082 8083
+
+ENTRYPOINT ["/backend"]

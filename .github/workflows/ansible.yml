@@ -1,0 +1,41 @@
+name: ansible
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ansible/**"
+      - ".ansible-lint"
+      - ".github/workflows/ansible.yml"
+  pull_request:
+    paths:
+      - "ansible/**"
+      - ".ansible-lint"
+      - ".github/workflows/ansible.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: syntax-check and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install tooling
+        run: pip install ansible-core ansible-lint yamllint
+
+      - name: yamllint
+        run: yamllint -c .yamllint ansible
+
+      - name: syntax check
+        run: ansible-playbook -i ansible/inventory/hosts.ini ansible/site.yml --syntax-check
+
+      - name: ansible-lint
+        run: ansible-lint ansible

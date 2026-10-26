@@ -1,0 +1,80 @@
+groups:
+  - name: api-gateway.rules
+    rules:
+      - alert: ApiGatewayDown
+        expr: up{job=~".*api-gateway.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: api-gateway
+        annotations:
+          summary: "API gateway target is down"
+          description: "Prometheus cannot scrape {{ $labels.instance }} (job {{ $labels.job }}) for more than 2 minutes."
+
+      - alert: ApiGatewayAbsent
+        expr: absent(up{job=~".*api-gateway.*"})
+        for: 5m
+        labels:
+          severity: critical
+          component: api-gateway
+        annotations:
+          summary: "No API gateway scrape target is registered"
+          description: "Prometheus has no target matching job=~'.*api-gateway.*'. Check the ServiceMonitor or scrape config."
+
+      - alert: ApiGatewayHighErrorRate
+        expr: |
+          sum(rate(http_request_counter{status=~"5.."}[5m]))
+            /
+          clamp_min(sum(rate(http_request_counter[5m])), 0.001)
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: api-gateway
+        annotations:
+          summary: "API gateway 5xx rate above 5%"
+          description: "The gateway is returning 5xx for {{ $value | humanizePercentage }} of requests over the last 5 minutes."
+
+      - alert: ApiGatewayHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(http_request_timer_bucket[5m])) by (le)
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: api-gateway
+        annotations:
+          summary: "API gateway p95 latency above 1s"
+          description: "p95 request latency is {{ $value | humanizeDuration }} over the last 5 minutes."
+
+      - alert: ApiGatewayRateLimitSpike
+        expr: sum(rate(gateway_rate_limited_total[5m])) > 100
+        for: 5m
+        labels:
+          severity: warning
+          component: api-gateway
+        annotations:
+          summary: "High rate of throttled requests"
+          description: "{{ $value | humanize }} requests/second are being rejected by the rate limiter."
+
+      - alert: ApiGatewayCircuitBreakerOpen
+        expr: max by (service) (gateway_circuit_breaker_state) >= 1
+        for: 5m
+        labels:
+          severity: critical
+          component: api-gateway
+        annotations:
+          summary: "Circuit breaker open for {{ $labels.service }}"
+          description: "Circuit breaker state for service {{ $labels.service }} has been open or half-open for 5 minutes."
+
+      - alert: ApiGatewayServiceUnavailable
+        expr: sum(rate(http_request_counter{status="503"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: api-gateway
+        annotations:
+          summary: "API gateway is returning 503s"
+          description: "More than 1 req/s of 503 responses over 5 minutes. Check backend health and circuit breaker state."

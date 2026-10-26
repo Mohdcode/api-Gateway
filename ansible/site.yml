@@ -1,0 +1,22 @@
+---
+- name: Provision container and Kubernetes tooling
+  hosts: gateway
+  become: true
+  gather_facts: true
+  roles:
+    - role: common
+      tags: [common]
+    - role: docker
+      tags: [docker]
+    - role: kind
+      tags: [kind]
+    - role: kubernetes_tools
+      tags: [kubectl, helm]
+
+- name: Deploy the API gateway stack
+  hosts: gateway
+  become: true
+  gather_facts: false
+  roles:
+    - role: api_gateway
+      tags: [deploy, gateway]

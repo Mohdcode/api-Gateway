@@ -1,0 +1,169 @@
+name: api-gateway
+
+x-backend: &backend
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - gateway
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD:?REDIS_PASSWORD is required}\""]
+    environment:
+      - REDIS_PASSWORD
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - gateway
+
+  backend-1:
+    <<: *backend
+    image: api-gateway-backend-1:local
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        BACKEND: backend1
+    environment:
+      PORT: ":8081"
+    expose:
+      - "8081"
+
+  backend-2:
+    <<: *backend
+    image: api-gateway-backend-2:local
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        BACKEND: backend2
+    environment:
+      PORT: ":8082"
+    expose:
+      - "8082"
+
+  backend-3:
+    <<: *backend
+    image: api-gateway-backend-3:local
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        BACKEND: backend3
+    environment:
+      PORT: ":8083"
+    expose:
+      - "8083"
+
+  gateway:
+    image: api-gateway:local
+    build:
+      context: .
+      args:
+        VERSION: "${VERSION:-dev}"
+        COMMIT: "${GIT_SHA:-unknown}"
+        BUILD_DATE: "${BUILD_DATE:-unknown}"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - CONFIG_PATH=/etc/gateway/config.yaml
+      - PORT=:8080
+      - PPROF_ADDR=:6060
+      - JWT_SECRET
+      - API_KEYS
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:6060:6060"
+    volumes:
+      - ./deploy/docker/config.yaml:/etc/gateway/config.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend-1:
+        condition: service_started
+      backend-2:
+        condition: service_started
+      backend-3:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/gateway", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - gateway
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./deploy/docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      gateway:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - gateway
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./deploy/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/k8s/monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/api-gateway.json:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - gateway
+
+networks:
+  gateway:
+    driver: bridge
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:

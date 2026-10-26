@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars and adjust.
+cluster_name = "api-gateway"
+overlay      = "dev"
+image_tag    = "dev"
+registry     = "ghcr.io/mohdcode"
+
+install_monitoring = true
+
+# Set this to a pinned kindest/node image for reproducible clusters.
+# node_image = "kindest/node:v1.34.0"
+
+# Pin chart versions here when you need a reproducible upgrade cadence.
+# ingress_nginx_chart_version        = "4.15.1"
+# metrics_server_chart_version       = "3.14.0"
+# kube_prometheus_stack_chart_version = "92.13.1"

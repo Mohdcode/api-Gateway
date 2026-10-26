@@ -2,16 +2,26 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	_ "net/http/pprof"
@@ -21,6 +31,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	healthCheckInterval = 10 * time.Second
+	healthCheckTimeout  = 2 * time.Second
+	cbProbeTTLMillis    = 30_000
+)
+
+// Populated at build time with -ldflags.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
 )
 
 var counter = prometheus.NewCounterVec(
@@ -61,25 +84,152 @@ func init() {
 	prometheus.MustRegister(counter, timer, rateLimited, cbState, proxyCanceledCounter)
 }
 
+// rateLimitScript implements a token bucket atomically in Redis.
+// KEYS[1] = bucket key
+// ARGV[1] = rate (tokens/second), ARGV[2] = capacity,
+// ARGV[3] = now (unix ms), ARGV[4] = key TTL (ms)
+const rateLimitScript = `
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+local bucket = redis.call('HMGET', key, 'tokens', 'last')
+local tokens = tonumber(bucket[1])
+local last = tonumber(bucket[2])
+if tokens == nil then
+	tokens = capacity
+	last = now
+end
+
+local elapsed = math.max(0, now - last) / 1000
+tokens = math.min(capacity, tokens + (elapsed * rate))
+
+local allowed = 0
+if tokens >= 1 then
+	tokens = tokens - 1
+	allowed = 1
+end
+
+redis.call('HSET', key, 'tokens', tokens, 'last', now)
+redis.call('PEXPIRE', key, ttl)
+return allowed
+`
+
+// cbAllowScript decides whether a request may pass and performs the
+// closed -> open -> half-open transition atomically across gateway instances.
+// KEYS: state, last failure, probe lock
+// ARGV: reset timeout (s), now (unix s), probe TTL (ms)
+// Returns {state, allowed}.
+const cbAllowScript = `
+local stateKey = KEYS[1]
+local lastKey = KEYS[2]
+local probeKey = KEYS[3]
+local reset = tonumber(ARGV[1])
+local now = tonumber(ARGV[2])
+local probeTTL = tonumber(ARGV[3])
+
+local state = tonumber(redis.call('GET', stateKey) or '0')
+
+if state == 0 then
+	return {0, 1}
+end
+
+if state == 1 then
+	local last = tonumber(redis.call('GET', lastKey) or '0')
+	if last > 0 and (now - last) >= reset then
+		redis.call('SET', stateKey, 2)
+		state = 2
+	else
+		return {1, 0}
+	end
+end
+
+if redis.call('EXISTS', probeKey) == 0 then
+	redis.call('SET', probeKey, '1')
+	redis.call('PEXPIRE', probeKey, probeTTL)
+	return {2, 1}
+end
+return {2, 0}
+`
+
+// cbReportScript records the outcome of an allowed request.
+// KEYS: state, failures, last failure, probe lock
+// ARGV: failure threshold, success (1/0), now (unix s)
+// Returns the resulting state.
+const cbReportScript = `
+local stateKey = KEYS[1]
+local failsKey = KEYS[2]
+local lastKey = KEYS[3]
+local probeKey = KEYS[4]
+local threshold = tonumber(ARGV[1])
+local success = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+redis.call('DEL', probeKey)
+
+if success == 1 then
+	redis.call('SET', stateKey, 0)
+	redis.call('DEL', failsKey)
+	return 0
+end
+
+local state = tonumber(redis.call('GET', stateKey) or '0')
+
+if state == 2 then
+	redis.call('SET', stateKey, 1)
+	redis.call('SET', lastKey, now)
+	return 1
+end
+
+local fails = redis.call('INCR', failsKey)
+if fails >= threshold then
+	redis.call('SET', stateKey, 1)
+	redis.call('SET', lastKey, now)
+	return 1
+end
+
+return state
+`
+
 type statusRecorder struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
+	wroteHeader bool
 }
 
 func (rec *statusRecorder) WriteHeader(code int) {
+	if rec.wroteHeader {
+		return
+	}
 	rec.statusCode = code
+	rec.wroteHeader = true
 	rec.ResponseWriter.WriteHeader(code)
+}
+
+func (rec *statusRecorder) Unwrap() http.ResponseWriter {
+	return rec.ResponseWriter
 }
 
 type Config struct {
 	Port             string      `yaml:"port"`
+	JwtSecret        string      `yaml:"jwt_secret"`
+	Redis            RedisConfig `yaml:"redis"`
 	Services         []Service   `yaml:"services"`
 	MiddlewareConfig ConfigTypes `yaml:"middleware_config"`
-	JwtSecret        string      `yaml:"jwt_secret"`
 }
+
+type RedisConfig struct {
+	Addr     string `yaml:"addr"`
+	Password string `yaml:"password"`
+	DB       int    `yaml:"db"`
+}
+
 type ConfigTypes struct {
 	ApiKeyAuth ApiConfig `yaml:"auth_apikey"`
 }
+
 type ApiConfig struct {
 	ValidKeys []string `yaml:"valid_keys"`
 }
@@ -89,148 +239,54 @@ type Service struct {
 	Route      string   `yaml:"route_pattern"`
 	Urls       []string `yaml:"urls"`
 	Middleware []string `yaml:"middleware"`
-	proxies    []*httputil.ReverseProxy
-	count      uint64
-	healthy    sync.Map // map[string]bool
-	activeConns sync.Map // map[string]*int64
 
-	// tuning values
 	RateLimitRPS          float64 `yaml:"rate_limit_rps"`
 	RateLimitBurst        float64 `yaml:"rate_limit_burst"`
 	CBFailureThreshold    int     `yaml:"cb_failure_threshold"`
 	CBResetTimeoutSeconds int     `yaml:"cb_reset_timeout_seconds"`
+
+	backends []*backend
+	next     uint64
+}
+
+type backend struct {
+	url     string
+	proxy   *httputil.ReverseProxy
+	conns   atomic.Int64
+	healthy atomic.Bool
 }
 
 type MiddlewareWrapper func(next http.Handler) http.Handler
 
-type TokenBucket struct {
-	mu       sync.Mutex
-	tokens   float64
-	last     time.Time
-	rate     float64
-	capacity float64
-}
-
-func NewTokenBucket(rate, capacity float64) *TokenBucket {
-	return &TokenBucket{
-		tokens:   capacity,
-		last:     time.Now(),
-		rate:     rate,
-		capacity: capacity,
-	}
-}
-
-func (tb *TokenBucket) TryConsume() bool {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
-	now := time.Now()
-	elapsed := now.Sub(tb.last).Seconds()
-	tb.last = now
-	tb.tokens += elapsed * tb.rate
-	if tb.tokens > tb.capacity {
-		tb.tokens = tb.capacity
-	}
-	if tb.tokens >= 1.0 {
-		tb.tokens -= 1.0
-		return true
-	}
-	return false
-}
-
-type CBState int
-
-const (
-	CBClosed CBState = iota
-	CBOpen
-	CBHalfOpen
-)
-
-type CircuitBreaker struct {
-	mu            sync.Mutex
-	state         CBState
-	failures      int
-	lastFailure   time.Time
-	failureThresh int
-	resetTimeout  time.Duration
-	halfProbes    int
-}
-
-func NewCircuitBreaker(failureThresh int, resetTimeoutSeconds int) *CircuitBreaker {
-	if failureThresh <= 0 {
-		failureThresh = 5
-	}
-	if resetTimeoutSeconds <= 0 {
-		resetTimeoutSeconds = 10
-	}
-	return &CircuitBreaker{
-		state:         CBClosed,
-		failures:      0,
-		failureThresh: failureThresh,
-		resetTimeout:  time.Duration(resetTimeoutSeconds) * time.Second,
-		halfProbes:    1,
-	}
-}
-
-func (cb *CircuitBreaker) AllowRequest() bool {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-	now := time.Now()
-
-	switch cb.state {
-	case CBClosed:
-		return true
-	case CBOpen:
-		if now.Sub(cb.lastFailure) >= cb.resetTimeout {
-			cb.state = CBHalfOpen
-			cb.halfProbes = 1
-			return true
-		}
-		return false
-	case CBHalfOpen:
-		if cb.halfProbes > 0 {
-			cb.halfProbes--
-			return true
-		}
-		return false
-	default:
-		return false
-	}
-}
-
-func (cb *CircuitBreaker) Report(success bool) {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-	if success {
-		cb.failures = 0
-		cb.state = CBClosed
-		return
-	}
-	cb.failures++
-	cb.lastFailure = time.Now()
-	if cb.failures >= cb.failureThresh {
-		cb.state = CBOpen
-	}
-	if cb.state == CBHalfOpen {
-		cb.state = CBOpen
-	}
-}
-
-func (cb *CircuitBreaker) State() CBState {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-	return cb.state
+type authConfig struct {
+	keys      map[string]bool
+	jwtSecret string
 }
 
 type Gateway struct {
-	Ser             map[string]*Service
-	wrappers        map[string]MiddlewareWrapper
-	apikeys         map[string]bool
-	rateLimiters    sync.Map
-	circuitBreakers map[string]*CircuitBreaker
-	transport       *http.Transport
-	rdb             *redis.Client
-	jwtSecret       string
+	services  atomic.Pointer[map[string]*Service]
+	auth      atomic.Pointer[authConfig]
+	wrappers  map[string]MiddlewareWrapper
+	transport *http.Transport
+	rdb       *redis.Client
+	now       func() time.Time
+}
+
+type ctxKey string
+
+const identityKey ctxKey = "gateway.identity"
+
+func hashSecret(s, key string) string {
+	mac := hmac.New(sha256.New, []byte(key))
+	_, _ = mac.Write([]byte(s))
+	return hex.EncodeToString(mac.Sum(nil)[:16])
+}
+
+func (g *Gateway) clock() time.Time {
+	if g.now != nil {
+		return g.now()
+	}
+	return time.Now()
 }
 
 func (g *Gateway) register(name string, wrapper MiddlewareWrapper) {
@@ -240,29 +296,34 @@ func (g *Gateway) register(name string, wrapper MiddlewareWrapper) {
 
 func (g *Gateway) authAPIKeyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Try JWT first
-		authHeader := r.Header.Get("Authorization")
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-			
-			token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-				return []byte(g.jwtSecret), nil 
-			})
-
-			if err == nil && token.Valid {
-				next.ServeHTTP(w, r)
-				return
-			}
-		}
-
-		// Fallback to API Key
-		apiKey := r.Header.Get("X-API-KEY")
-		if _, valid := g.apikeys[apiKey]; !valid {
-			log.Printf("Authentication failed, API KEY %s not found", apiKey)
+		auth := g.auth.Load()
+		if auth == nil {
 			http.Error(w, "Authentication Failed", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+
+		if scheme, raw, ok := strings.Cut(r.Header.Get("Authorization"), " "); ok && strings.EqualFold(scheme, "Bearer") {
+			token, err := jwt.Parse(strings.TrimSpace(raw), func(token *jwt.Token) (any, error) {
+				return []byte(auth.jwtSecret), nil
+			}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+			if err == nil && token.Valid {
+				subject, _ := token.Claims.GetSubject()
+				identity := "jwt:" + subject
+				if subject == "" {
+					identity = "jwt:" + hashSecret(raw, auth.jwtSecret)
+				}
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, identity)))
+				return
+			}
+			log.Printf("invalid bearer token: %v", err)
+		}
+
+		apiKey := r.Header.Get("X-API-KEY")
+		if apiKey == "" || !auth.keys[apiKey] {
+			http.Error(w, "Authentication Failed", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, "key:"+hashSecret(apiKey, auth.jwtSecret))))
 	})
 }
 
@@ -274,35 +335,41 @@ func (g *Gateway) metricsMiddleware(next http.Handler) http.Handler {
 			statusCode:     http.StatusOK,
 		}
 		serviceName := ""
-		service := g.findService(r)
-		if service != nil {
+		if service := g.findService(r); service != nil {
 			serviceName = service.Name
 		}
 		next.ServeHTTP(recorder, r)
-		duration := time.Since(startTime).Seconds()
 		counter.WithLabelValues(r.Method, fmt.Sprintf("%d", recorder.statusCode), serviceName).Inc()
-		timer.WithLabelValues(r.Method, serviceName).Observe(duration)
+		timer.WithLabelValues(r.Method, serviceName).Observe(time.Since(startTime).Seconds())
 	})
+}
+
+func (g *Gateway) clientIdentity(r *http.Request) string {
+	if id, ok := r.Context().Value(identityKey).(string); ok && id != "" {
+		return id
+	}
+	if apiKey := r.Header.Get("X-API-KEY"); apiKey != "" {
+		if auth := g.auth.Load(); auth != nil && auth.jwtSecret != "" {
+			return "key:" + hashSecret(apiKey, auth.jwtSecret)
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return "ip:" + r.RemoteAddr
+	}
+	return "ip:" + host
 }
 
 func (g *Gateway) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		service := g.findService(r)
-
-		apiKey := r.Header.Get("X-API-KEY")
-		key := apiKey
-		if key == "" {
-			host, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				key = r.RemoteAddr
-			} else {
-				key = host
-			}
-		}
-
 		rate := 100.0
 		burst := 200.0
+		serviceName := "unknown"
+		route := ""
 		if service != nil {
+			serviceName = service.Name
+			route = service.Route
 			if service.RateLimitRPS > 0 {
 				rate = service.RateLimitRPS
 			}
@@ -311,44 +378,26 @@ func (g *Gateway) rateLimitMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		mapKey := "rl:" + key
-		if service != nil {
-			mapKey = mapKey + ":" + service.Route
+		if g.rdb == nil {
+			next.ServeHTTP(w, r)
+			return
 		}
 
-		ctx := r.Context()
-		now := time.Now().Unix()
-		
-		// Lua script for atomic Token Bucket in Redis
-		script := `
-		local key = KEYS[1]
-		local rate = tonumber(ARGV[1])
-		local capacity = tonumber(ARGV[2])
-		local now = tonumber(ARGV[3])
-		
-		local bucket = redis.call("HMGET", key, "tokens", "last")
-		local tokens = tonumber(bucket[1]) or capacity
-		local last = tonumber(bucket[2]) or now
-		
-		local elapsed = math.max(0, now - last)
-		tokens = math.min(capacity, tokens + (elapsed * rate))
-		
-		if tokens >= 1 then
-			tokens = tokens - 1
-			redis.call("HMSET", key, "tokens", tokens, "last", now)
-			return 1
-		else
-			return 0
-		end
-		`
-		
-		allowed, err := g.rdb.Eval(ctx, script, []string{mapKey}, rate, burst, now).Int()
-		if err != nil || allowed == 0 {
-			serviceName := "unknown"
-			if service != nil {
-				serviceName = service.Name
-			}
-			rateLimited.WithLabelValues(serviceName, "redis_token_bucket").Inc()
+		key := "rl:" + g.clientIdentity(r) + ":" + route
+		ttl := int64(math.Max(60_000, (burst/rate)*2_000))
+		allowed, err := g.rdb.Eval(r.Context(), rateLimitScript, []string{key},
+			rate, burst, g.clock().UnixMilli(), ttl).Int()
+
+		if err != nil {
+			// Fail open: Redis being down must not take the whole gateway down.
+			log.Printf("rate limiter unavailable, allowing request: %v", err)
+			rateLimited.WithLabelValues(serviceName, "redis_error").Inc()
+			next.ServeHTTP(w, r)
+			return
+		}
+		if allowed == 0 {
+			rateLimited.WithLabelValues(serviceName, "token_bucket").Inc()
+			w.Header().Set("Retry-After", "1")
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
@@ -359,63 +408,58 @@ func (g *Gateway) rateLimitMiddleware(next http.Handler) http.Handler {
 func (g *Gateway) circuitBreakerMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		service := g.findService(r)
-		if service == nil {
+		if service == nil || g.rdb == nil {
 			next.ServeHTTP(w, r)
 			return
 		}
-		
-		cbKey := "cb:" + service.Route
-		ctx := r.Context()
-		
-		// Distributed state check in Redis
-		state, err := g.rdb.Get(ctx, cbKey).Int()
-		if err != nil {
-			state = int(CBClosed) // Default to closed if not found
+
+		threshold := service.CBFailureThreshold
+		if threshold <= 0 {
+			threshold = 5
 		}
-		
+		resetSeconds := service.CBResetTimeoutSeconds
+		if resetSeconds <= 0 {
+			resetSeconds = 10
+		}
+
+		base := "cb:" + service.Route
+		keys := []string{base + ":state", base + ":fails", base + ":last", base + ":probe"}
+
+		res, err := g.rdb.Eval(r.Context(), cbAllowScript,
+			[]string{keys[0], keys[2], keys[3]},
+			resetSeconds, float64(g.clock().UnixNano())/1e9, cbProbeTTLMillis).Int64Slice()
+		if err != nil || len(res) != 2 {
+			// Fail open on Redis errors.
+			log.Printf("circuit breaker unavailable for %s, allowing request: %v", service.Name, err)
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		state, allowed := res[0], res[1] == 1
 		cbState.WithLabelValues(service.Name).Set(float64(state))
-
-		if state == int(CBOpen) {
-			// Check if timeout has passed to allow probe
-			lastFail, _ := g.rdb.Get(ctx, cbKey+":last").Time()
-			if time.Since(lastFail) < time.Duration(service.CBResetTimeoutSeconds)*time.Second {
-				log.Printf("circuit open for service %s, rejecting request", service.Name)
-				http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
-				return
-			}
-			// Transition to Half-Open for this request
-			state = int(CBHalfOpen)
+		if !allowed {
+			http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
+			return
 		}
 
-		rec := &statusRecorder{
-			ResponseWriter: w,
-			statusCode:     http.StatusOK,
-		}
+		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rec, r)
-		
-		if rec.statusCode >= 500 {
-			// Fail: Increment failures and potentially open circuit
-			fails, _ := g.rdb.Incr(ctx, cbKey+":fails").Result()
-			if fails >= int64(service.CBFailureThreshold) {
-				g.rdb.Set(ctx, cbKey, int(CBOpen), 0)
-				g.rdb.Set(ctx, cbKey+":last", time.Now(), 0)
-			}
-			// If we were half-open and failed, go back to open
-			if state == int(CBHalfOpen) {
-				g.rdb.Set(ctx, cbKey, int(CBOpen), 0)
-				g.rdb.Set(ctx, cbKey+":last", time.Now(), 0)
-			}
-		} else {
-			// Success: Close circuit and reset failures
-			g.rdb.Set(ctx, cbKey, int(CBClosed), 0)
-			g.rdb.Del(ctx, cbKey+":fails")
+
+		success := int64(0)
+		if rec.statusCode < 500 {
+			success = 1
 		}
-		
-		cbState.WithLabelValues(service.Name).Set(float64(state))
+		newState, err := g.rdb.Eval(context.Background(), cbReportScript, keys,
+			threshold, success, float64(g.clock().UnixNano())/1e9).Int64()
+		if err != nil {
+			log.Printf("failed to record circuit breaker outcome for %s: %v", service.Name, err)
+			return
+		}
+		cbState.WithLabelValues(service.Name).Set(float64(newState))
 	})
 }
 
-func NewGateway(cfg *Config) *Gateway {
+func NewGateway(cfg *Config) (*Gateway, error) {
 	sharedTransport := &http.Transport{
 		MaxIdleConns:          20000,
 		MaxIdleConnsPerHost:   5000,
@@ -425,279 +469,513 @@ func NewGateway(cfg *Config) *Gateway {
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+	redisAddr := cfg.Redis.Addr
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
 
 	gw := &Gateway{
-		Ser:             make(map[string]*Service),
-		wrappers:        make(map[string]MiddlewareWrapper),
-		apikeys:         make(map[string]bool),
-		circuitBreakers: make(map[string]*CircuitBreaker),
-		transport:       sharedTransport,
-		rdb:             rdb,
-		jwtSecret:       cfg.JwtSecret,
+		wrappers:  make(map[string]MiddlewareWrapper),
+		transport: sharedTransport,
+		now:       time.Now,
+		rdb: redis.NewClient(&redis.Options{
+			Addr:     redisAddr,
+			Password: cfg.Redis.Password,
+			DB:       cfg.Redis.DB,
+		}),
 	}
-	if gw.jwtSecret == "" {
-		gw.jwtSecret = "default_secret_key"
+
+	pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := gw.rdb.Ping(pingCtx).Err(); err != nil {
+		log.Printf("warning: Redis unavailable at %s: %v (rate limiting and circuit breaking will fail open)", redisAddr, err)
 	}
-	for _, key := range cfg.MiddlewareConfig.ApiKeyAuth.ValidKeys {
-		gw.apikeys[key] = true
+
+	services, err := gw.buildServices(cfg)
+	if err != nil {
+		return nil, err
 	}
+	gw.services.Store(&services)
+	gw.auth.Store(newAuthConfig(cfg))
+
 	gw.register("auth_apikey", gw.authAPIKeyMiddleware)
 	gw.register("metrics", gw.metricsMiddleware)
 	gw.register("rate_limit", gw.rateLimitMiddleware)
 	gw.register("circuit_breaker", gw.circuitBreakerMiddleware)
 
+	gw.startHealthChecks()
+	return gw, nil
+}
+
+func newAuthConfig(cfg *Config) *authConfig {
+	keys := make(map[string]bool, len(cfg.MiddlewareConfig.ApiKeyAuth.ValidKeys))
+	for _, key := range cfg.MiddlewareConfig.ApiKeyAuth.ValidKeys {
+		keys[key] = true
+	}
+	secret := cfg.JwtSecret
+	if secret == "" {
+		secret = "default_secret_key"
+		log.Println("warning: jwt_secret is not set, using an insecure default")
+	}
+	return &authConfig{keys: keys, jwtSecret: secret}
+}
+
+func (g *Gateway) buildServices(cfg *Config) (map[string]*Service, error) {
+	services := make(map[string]*Service, len(cfg.Services))
 	for i := range cfg.Services {
-		currSer := &cfg.Services[i]
-		if len(currSer.Urls) == 0 {
-			log.Printf("service %s does not have any url defined", currSer.Name)
-			return nil
+		c := &cfg.Services[i]
+		if c.Route == "" {
+			return nil, fmt.Errorf("service %q has no route_pattern", c.Name)
 		}
-		for j := 0; j < len(currSer.Urls); j++ {
-			target, err := url.Parse(currSer.Urls[j])
-			if err != nil {
-				log.Printf("invalid url %s for service %s: %v", currSer.Urls[j], currSer.Name, err)
-				return nil
+		if len(c.Urls) == 0 {
+			return nil, fmt.Errorf("service %q does not have any url defined", c.Name)
+		}
+		if _, exists := services[c.Route]; exists {
+			return nil, fmt.Errorf("duplicate route_pattern %q", c.Route)
+		}
+
+		service := &Service{
+			Name:                  c.Name,
+			Route:                 c.Route,
+			Urls:                  append([]string(nil), c.Urls...),
+			Middleware:            append([]string(nil), c.Middleware...),
+			RateLimitRPS:          c.RateLimitRPS,
+			RateLimitBurst:        c.RateLimitBurst,
+			CBFailureThreshold:    c.CBFailureThreshold,
+			CBResetTimeoutSeconds: c.CBResetTimeoutSeconds,
+		}
+
+		for _, rawURL := range c.Urls {
+			target, err := url.Parse(rawURL)
+			if err != nil || target.Host == "" || (target.Scheme != "http" && target.Scheme != "https") {
+				return nil, fmt.Errorf("invalid url %q for service %q", rawURL, c.Name)
 			}
+
+			backendURL := rawURL
 			proxy := httputil.NewSingleHostReverseProxy(target)
-			proxy.Transport = sharedTransport
+			proxy.Transport = g.transport
 			proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-				if err == context.Canceled {
+				if errors.Is(err, context.Canceled) {
 					proxyCanceledCounter.Inc()
 					return
 				}
-				log.Printf("proxy error: %v (backend=%s client=%s path=%s)", err, target.String(), req.RemoteAddr, req.URL.Path)
+				log.Printf("proxy error: %v (backend=%s client=%s path=%s)", err, backendURL, req.RemoteAddr, req.URL.Path)
 				http.Error(rw, "bad gateway", http.StatusBadGateway)
 			}
-			currSer.proxies = append(currSer.proxies, proxy)
-			currSer.healthy.Store(currSer.Urls[j], true) // Assume healthy initially
-			
-			var connCount int64
-			currSer.activeConns.Store(currSer.Urls[j], &connCount)
-		}
-		gw.Ser[currSer.Route] = currSer
-	}
 
-	gw.startHealthChecks()
-	return gw
+			b := &backend{url: backendURL, proxy: proxy}
+			b.healthy.Store(true)
+			service.backends = append(service.backends, b)
+		}
+		services[service.Route] = service
+	}
+	return services, nil
 }
 
 func (g *Gateway) findService(r *http.Request) *Service {
-	for route, service := range g.Ser {
-		if strings.HasPrefix(r.URL.Path, route) {
-			return service
+	services := g.services.Load()
+	if services == nil {
+		return nil
+	}
+	var best *Service
+	bestLen := -1
+	for route, service := range *services {
+		if strings.HasPrefix(r.URL.Path, route) && len(route) > bestLen {
+			best = service
+			bestLen = len(route)
 		}
 	}
-	return nil
+	return best
 }
 
 func (g *Gateway) startHealthChecks() {
-	ticker := time.NewTicker(10 * time.Second)
+	g.startHealthChecksWith(context.Background(), healthCheckInterval)
+}
+
+func (g *Gateway) startHealthChecksWith(ctx context.Context, interval time.Duration) {
+	client := &http.Client{Timeout: healthCheckTimeout}
 	go func() {
-		for range ticker.C {
-			for _, service := range g.Ser {
-				for _, url := range service.Urls {
-					go func(s *Service, targetUrl string) {
-						client := http.Client{Timeout: 2 * time.Second}
-						resp, err := client.Get(targetUrl + "/health")
-						if err != nil || resp.StatusCode != http.StatusOK {
-							s.healthy.Store(targetUrl, false)
-							log.Printf("Health check failed for %s at %s", s.Name, targetUrl)
-						} else {
-							s.healthy.Store(targetUrl, true)
-						}
-						if resp != nil {
-							resp.Body.Close()
-						}
-					}(service, url)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			services := g.services.Load()
+			if services == nil {
+				continue
+			}
+			for _, service := range *services {
+				for _, b := range service.backends {
+					go checkBackend(client, service, b)
 				}
 			}
 		}
 	}()
 }
 
-func (s *Service) NewProxy() *httputil.ReverseProxy {
-	// Implement Least Connections Load Balancing
-	var bestProxyIndex = -1
-	var minConns int64 = -1
-
-	numProxies := len(s.proxies)
-	for i := 0; i < numProxies; i++ {
-		targetUrl := s.Urls[i]
-		
-		// Only consider healthy backends
-		if val, ok := s.healthy.Load(targetUrl); ok && val.(bool) == false {
-			continue
-		}
-
-		if connsVal, ok := s.activeConns.Load(targetUrl); ok {
-			conns := atomic.LoadInt64(connsVal.(*int64))
-			if minConns == -1 || conns < minConns {
-				minConns = conns
-				bestProxyIndex = i
-			}
+func checkBackend(client *http.Client, service *Service, b *backend) {
+	resp, err := client.Get(strings.TrimRight(b.url, "/") + "/health")
+	healthy := false
+	if err == nil {
+		healthy = resp.StatusCode == http.StatusOK
+		if resp.Body != nil {
+			resp.Body.Close()
 		}
 	}
 
-	if bestProxyIndex == -1 {
-		// Fallback to first proxy if all unhealthy or error
-		return s.proxies[0]
+	if b.healthy.Swap(healthy) != healthy {
+		if healthy {
+			log.Printf("backend %s for service %s is healthy again", b.url, service.Name)
+		} else {
+			log.Printf("health check failed for %s at %s: %v", service.Name, b.url, err)
+		}
 	}
-
-	return s.proxies[bestProxyIndex]
 }
 
-// Wrapper to track active connections
-func (g *Gateway) trackConnections(service *Service, proxy *httputil.ReverseProxy) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		targetUrl := ""
-		// Find which URL this proxy corresponds to (simplified for this implementation)
-		// In a full implementation, the proxy would be wrapped in a struct containing its URL
-		for i, p := range service.proxies {
-			if p == proxy {
-				targetUrl = service.Urls[i]
-				break
-			}
-		}
+// pickBackend implements least-connections load balancing with a rotating
+// tie-break, so equally loaded backends share traffic instead of the first
+// one always winning.
+func (s *Service) pickBackend() *backend {
+	n := len(s.backends)
+	if n == 0 {
+		return nil
+	}
 
-		if targetUrl == "" {
-			proxy.ServeHTTP(w, r)
-			return
+	start := int(atomic.AddUint64(&s.next, 1) - 1)
+	var best *backend
+	var bestConns int64
+	for i := 0; i < n; i++ {
+		b := s.backends[(start+i)%n]
+		if !b.healthy.Load() {
+			continue
 		}
-
-		if connsVal, ok := service.activeConns.Load(targetUrl); ok {
-			atomic.AddInt64(connsVal.(*int64), 1)
-			defer atomic.AddInt64(connsVal.(*int64), -1)
+		conns := b.conns.Load()
+		if best == nil || conns < bestConns {
+			best = b
+			bestConns = conns
 		}
-
-		proxy.ServeHTTP(w, r)
-	})
+	}
+	return best
 }
 
 func (g *Gateway) handleGateway(w http.ResponseWriter, r *http.Request) {
 	service := g.findService(r)
 	if service == nil {
-		log.Printf("No service found for the url %s", r.URL.Path)
 		http.Error(w, "No service found for this url", http.StatusNotFound)
 		return
 	}
 
-	proxy := service.NewProxy()
-	var curr http.Handler = g.trackConnections(service, proxy)
-	
+	var curr http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b := service.pickBackend()
+		if b == nil {
+			http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
+			return
+		}
+		b.conns.Add(1)
+		defer b.conns.Add(-1)
+		b.proxy.ServeHTTP(w, r)
+	})
+
 	for i := len(service.Middleware) - 1; i >= 0; i-- {
-		middlewareName := service.Middleware[i]
-		middleware, ok := g.wrappers[middlewareName]
+		name := service.Middleware[i]
+		middleware, ok := g.wrappers[name]
 		if !ok {
-			log.Printf("middleware with name %s is not present", middlewareName)
+			log.Printf("middleware with name %s is not present", name)
 			continue
 		}
 		curr = middleware(curr)
 	}
 
-	log.Printf("forwarding the request of %s path to the service %s with %d middlewares", r.URL.Path, service.Name, len(service.Middleware))
 	curr.ServeHTTP(w, r)
 }
 
 func (g *Gateway) reloadConfig(path string) {
-	newCfg := loadConfigPath(path)
-	if newCfg == nil {
-		log.Println("Failed to reload config, keeping old configuration")
+	cfg, err := loadConfigWithEnv(path)
+	if err != nil {
+		log.Printf("failed to reload config, keeping old configuration: %v", err)
 		return
 	}
 
-	log.Println("Reloading configuration...")
-
-	// Update API Keys
-	newKeys := make(map[string]bool)
-	for _, key := range newCfg.MiddlewareConfig.ApiKeyAuth.ValidKeys {
-		newKeys[key] = true
+	services, err := g.buildServices(cfg)
+	if err != nil {
+		log.Printf("failed to reload config, keeping old configuration: %v", err)
+		return
 	}
-	g.apikeys = newKeys
 
-	// Update Services
-	for route, service := range g.Ser {
-		var found *Service
-		for i := range newCfg.Services {
-			if newCfg.Services[i].Route == route {
-				found = &newCfg.Services[i]
-				break
-			}
-		}
-
-		if found != nil {
-			service.RateLimitRPS = found.RateLimitRPS
-			service.RateLimitBurst = found.RateLimitBurst
-			service.CBFailureThreshold = found.CBFailureThreshold
-			service.CBResetTimeoutSeconds = found.CBResetTimeoutSeconds
-			service.Middleware = found.Middleware
-		}
-	}
+	g.services.Store(&services)
+	g.auth.Store(newAuthConfig(cfg))
 	log.Println("Configuration reloaded successfully")
 }
 
-func (g *Gateway) watchConfig(path string) {
+func (g *Gateway) watchConfigWith(ctx context.Context, path string, interval time.Duration) {
 	go func() {
 		var lastMod time.Time
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 			info, err := os.Stat(path)
 			if err != nil {
 				log.Printf("Error stating config file: %v", err)
-				time.Sleep(5 * time.Second)
 				continue
 			}
-
 			if info.ModTime().After(lastMod) {
 				if !lastMod.IsZero() {
 					g.reloadConfig(path)
 				}
 				lastMod = info.ModTime()
 			}
-			time.Sleep(2 * time.Second)
 		}
 	}()
 }
 
-func loadConfigPath(p string) *Config {
-	var cfg Config
+func loadConfigPath(p string) (*Config, error) {
 	data, err := os.ReadFile(p)
 	if err != nil {
-		log.Fatalf("error loading the config %s: %v", p, err)
+		return nil, fmt.Errorf("error loading the config %s: %w", p, err)
 	}
+	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		log.Fatalf("error parsing config yaml: %v", err)
+		return nil, fmt.Errorf("error parsing config yaml %s: %w", p, err)
 	}
-	return &cfg
+	return &cfg, nil
+}
+
+// applyEnvOverrides lets container platforms configure the gateway without
+// rewriting the mounted config file. Explicit environment values win.
+func applyEnvOverrides(cfg *Config) {
+	if v := os.Getenv("PORT"); v != "" {
+		cfg.Port = v
+	}
+	if v := os.Getenv("JWT_SECRET"); v != "" {
+		cfg.JwtSecret = v
+	}
+	if v := os.Getenv("REDIS_ADDR"); v != "" {
+		cfg.Redis.Addr = v
+	}
+	if v := os.Getenv("REDIS_PASSWORD"); v != "" {
+		cfg.Redis.Password = v
+	}
+	if v := os.Getenv("REDIS_DB"); v != "" {
+		db, err := strconv.Atoi(v)
+		if err != nil {
+			log.Printf("ignoring invalid REDIS_DB %q: %v", v, err)
+		} else {
+			cfg.Redis.DB = db
+		}
+	}
+	if v, ok := os.LookupEnv("API_KEYS"); ok {
+		keys := make([]string, 0)
+		for _, key := range strings.Split(v, ",") {
+			if key = strings.TrimSpace(key); key != "" {
+				keys = append(keys, key)
+			}
+		}
+		cfg.MiddlewareConfig.ApiKeyAuth.ValidKeys = keys
+	}
+}
+
+func shutdownDelay() time.Duration {
+	raw := os.Getenv("SHUTDOWN_DELAY")
+	if raw == "" {
+		return 0
+	}
+	delay, err := time.ParseDuration(raw)
+	if err != nil || delay < 0 {
+		log.Printf("ignoring invalid SHUTDOWN_DELAY %q", raw)
+		return 0
+	}
+	return delay
+}
+
+func loadConfigWithEnv(p string) (*Config, error) {
+	cfg, err := loadConfigPath(p)
+	if err != nil {
+		return nil, err
+	}
+	applyEnvOverrides(cfg)
+	return cfg, nil
+}
+
+// Close releases resources held by the gateway.
+func (g *Gateway) Close() error {
+	if g.rdb == nil {
+		return nil
+	}
+	return g.rdb.Close()
+}
+
+func (g *Gateway) healthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
+}
+
+func (g *Gateway) readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if g.services.Load() == nil {
+		http.Error(w, "configuration not loaded", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready\n"))
+}
+
+func versionHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"version":   version,
+			"commit":    commit,
+			"buildDate": buildDate,
+			"goVersion": runtime.Version(),
+		})
+	}
+}
+
+// handler builds the HTTP mux shared by the server and the tests.
+func (g *Gateway) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/", http.HandlerFunc(g.handleGateway))
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", g.healthzHandler)
+	mux.HandleFunc("/readyz", g.readyzHandler)
+	mux.HandleFunc("/version", versionHandler())
+	return mux
+}
+
+func checkHealth(addr string) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthz returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func probeAddress() string {
+	if addr := os.Getenv("HEALTHCHECK_ADDR"); addr != "" {
+		return addr
+	}
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = ":8080"
+	}
+	if strings.HasPrefix(port, ":") {
+		return "127.0.0.1" + port
+	}
+	if host, p, err := net.SplitHostPort(port); err == nil {
+		_ = host
+		return net.JoinHostPort("127.0.0.1", p)
+	}
+	return "127.0.0.1:" + port
+}
+
+func runHealthCheck() int {
+	if err := checkHealth(probeAddress()); err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func run() int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	pprofAddr := os.Getenv("PPROF_ADDR")
+	if pprofAddr == "" {
+		pprofAddr = ":6060"
+	}
+	var pprofServer *http.Server
+	if !strings.EqualFold(pprofAddr, "off") {
+		pprofServer = &http.Server{Addr: pprofAddr, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			log.Printf("pprof listening on %s", pprofAddr)
+			if err := pprofServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("pprof server stopped: %v", err)
+			}
+		}()
+	}
+
+	configPath := os.Getenv("CONFIG_PATH")
+	if configPath == "" {
+		configPath = "config.yaml"
+		if flag.NArg() > 0 {
+			configPath = flag.Arg(0)
+		}
+	}
+	cfg, err := loadConfigWithEnv(configPath)
+	if err != nil {
+		log.Printf("%v", err)
+		return 1
+	}
+	log.Printf("starting gateway version=%s commit=%s port=%s", version, commit, cfg.Port)
+
+	gw, err := NewGateway(cfg)
+	if err != nil {
+		log.Printf("failed to initialize gateway: %v", err)
+		return 1
+	}
+	defer gw.Close()
+	gw.watchConfigWith(ctx, configPath, 2*time.Second)
+
+	server := &http.Server{
+		Addr:              cfg.Port,
+		Handler:           gw.handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		if delay := shutdownDelay(); delay > 0 {
+			log.Printf("shutdown signal received, waiting %s before draining", delay)
+			time.Sleep(delay)
+		} else {
+			log.Println("shutdown signal received, draining connections")
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+			return 1
+		}
+		if pprofServer != nil {
+			_ = pprofServer.Shutdown(shutdownCtx)
+		}
+		log.Println("gateway stopped")
+		return 0
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("error starting the server on port %s: %v", cfg.Port, err)
+			return 1
+		}
+		return 0
+	}
 }
 
 func main() {
-	go func() {
-		log.Println("pprof listening on :6060")
-		log.Println(http.ListenAndServe(":6060", nil))
-	}()
-
-	configPath := "config.yaml"
-	if len(os.Args) > 1 {
-		configPath = os.Args[1]
+	healthcheck := flag.Bool("healthcheck", false, "probe the local /healthz endpoint and exit")
+	flag.Parse()
+	if *healthcheck {
+		os.Exit(runHealthCheck())
 	}
-	cfg := loadConfigPath(configPath)
-	log.Printf("port %s", cfg.Port)
-	gw := NewGateway(cfg)
-	if gw == nil {
-		log.Fatal("failed to initialize gateway")
-	}
-	gw.watchConfig(configPath)
-	mux := http.NewServeMux()
-	mux.Handle("/", http.HandlerFunc(gw.handleGateway))
-	mux.Handle("/metrics", promhttp.Handler())
-	server := &http.Server{
-		Addr:    cfg.Port,
-		Handler: mux,
-	}
-	err := server.ListenAndServe()
-	if err != nil {
-		log.Fatalf("error starting the server on port %s: %v", cfg.Port, err)
-	}
+	os.Exit(run())
 }

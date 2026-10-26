@@ -1,0 +1,60 @@
+name: devcontainer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".devcontainer/**"
+      - ".github/workflows/devcontainer.yml"
+      - "Dockerfile"
+      - "Dockerfile.backend"
+      - "Makefile"
+      - "ansible/**"
+      - "deploy/**"
+      - "go.mod"
+      - "go.sum"
+      - "scripts/**"
+  pull_request:
+    paths:
+      - ".devcontainer/**"
+      - ".github/workflows/devcontainer.yml"
+      - "Dockerfile"
+      - "Dockerfile.backend"
+      - "Makefile"
+      - "ansible/**"
+      - "deploy/**"
+      - "go.mod"
+      - "go.sum"
+      - "scripts/**"
+  workflow_dispatch:
+
+concurrency:
+  group: devcontainer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build Dev Container and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: install Dev Containers CLI
+        run: npm install --global @devcontainers/cli@0.89.0
+
+      - name: build and start Dev Container
+        run: devcontainer up --workspace-folder .
+
+      - name: run Go tests inside Dev Container
+        run: devcontainer exec --workspace-folder . make test
+
+      - name: run DevOps validation inside Dev Container
+        run: devcontainer exec --workspace-folder . make validate-devops

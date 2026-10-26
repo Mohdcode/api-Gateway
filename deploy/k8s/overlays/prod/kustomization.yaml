@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: api-gateway
+
+resources:
+  - ../../base
+
+replicas:
+  - name: gateway
+    count: 3
+  - name: backend-1
+    count: 2
+  - name: backend-2
+    count: 2
+  - name: backend-3
+    count: 2
+
+images:
+  - name: ghcr.io/mohdcode/api-gateway
+    newTag: stable
+  - name: ghcr.io/mohdcode/api-gateway-backend-1
+    newTag: stable
+  - name: ghcr.io/mohdcode/api-gateway-backend-2
+    newTag: stable
+  - name: ghcr.io/mohdcode/api-gateway-backend-3
+    newTag: stable
+
+patches:
+  - path: hpa-patch.yaml
+  - path: gateway-resources-patch.yaml

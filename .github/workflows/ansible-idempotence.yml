@@ -1,0 +1,71 @@
+name: ansible-idempotence
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ansible/**"
+      - "deploy/**"
+      - "Dockerfile"
+      - "Dockerfile.backend"
+      - "scripts/**"
+      - ".github/workflows/ansible-idempotence.yml"
+  pull_request:
+    paths:
+      - "ansible/**"
+      - "deploy/**"
+      - "Dockerfile"
+      - "Dockerfile.backend"
+      - "scripts/**"
+      - ".github/workflows/ansible-idempotence.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ansible-idempotence-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  provision-twice:
+    name: provision disposable Linux runner twice
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install Ansible
+        run: python -m pip install ansible-core==2.21.5
+
+      - name: verify Docker daemon
+        run: docker info
+
+      - name: provision local kind stack
+        run: |
+          ansible-playbook -i ansible/inventory/hosts.ini ansible/site.yml \
+            --skip-tags docker \
+            --extra-vars "gateway_deploy_dir=${RUNNER_TEMP}/api-gateway-ansible-ci gateway_install_monitoring=false kind_cluster_name=api-gateway"
+
+      - name: verify second playbook run is idempotent
+        run: |
+          ansible-playbook -i ansible/inventory/hosts.ini ansible/site.yml \
+            --skip-tags docker \
+            --extra-vars "gateway_deploy_dir=${RUNNER_TEMP}/api-gateway-ansible-ci gateway_install_monitoring=false kind_cluster_name=api-gateway" \
+            | tee "${RUNNER_TEMP}/ansible-second-run.log"
+          if ! grep -Eq 'gateway-host[[:space:]]*:[[:space:]]+ok=[0-9]+[[:space:]]+changed=0[[:space:]]+unreachable=0[[:space:]]+failed=0([[:space:]]|$)' \
+            "${RUNNER_TEMP}/ansible-second-run.log"; then
+            echo "error: the second Ansible run reported changes or did not complete cleanly" >&2
+            exit 1
+          fi
+
+      - name: delete only the disposable Ansible test cluster
+        if: always()
+        run: |
+          if kind get clusters 2>/dev/null | grep -qx api-gateway; then
+            kind delete cluster --name api-gateway
+          fi

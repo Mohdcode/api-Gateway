@@ -1,0 +1,4 @@
+---
+# Empty versions resolve to the latest stable release.
+kubectl_version: ""
+helm_version: ""

@@ -1,0 +1,32 @@
+---
+- name: Map the host architecture for kind
+  ansible.builtin.set_fact:
+    kind_arch: "{{ 'amd64' if ansible_architecture in ['x86_64', 'amd64'] else 'arm64' }}"
+
+- name: Look up the latest kind release
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/kubernetes-sigs/kind/releases/latest
+    return_content: false
+  register: kind_release
+  changed_when: false
+  check_mode: false
+  when: kind_version | length == 0
+
+- name: Resolve the kind version to install
+  ansible.builtin.set_fact:
+    kind_effective_version: "{{ kind_version if kind_version | length > 0 else kind_release.json.tag_name }}"
+
+- name: Install the kind binary
+  ansible.builtin.get_url:
+    url: "https://github.com/kubernetes-sigs/kind/releases/download/{{ kind_effective_version }}/kind-{{ ansible_system | lower }}-{{ kind_arch }}"
+    dest: /usr/local/bin/kind
+    mode: "0755"
+    owner: root
+    group: root
+    force: false
+
+- name: Check the installed kind version
+  ansible.builtin.command: kind version
+  changed_when: false
+  register: kind_installed
+  failed_when: kind_installed.rc != 0

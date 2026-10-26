@@ -1,0 +1,88 @@
+name: terraform-kind
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - "deploy/**"
+      - "Dockerfile"
+      - "Dockerfile.backend"
+      - "scripts/**"
+      - ".github/workflows/terraform-kind.yml"
+  pull_request:
+    paths:
+      - "terraform/**"
+      - "deploy/**"
+      - "Dockerfile"
+      - "Dockerfile.backend"
+      - "scripts/**"
+      - ".github/workflows/terraform-kind.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: terraform-kind-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  apply-and-destroy:
+    name: Terraform kind apply, smoke, and destroy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_cluster_name: api-gateway-terraform-ci
+      TF_VAR_kubeconfig_path: /tmp/api-gateway-terraform-ci.kubeconfig
+      TF_VAR_ingress_http_host_port: "18080"
+      TF_VAR_ingress_https_host_port: "18443"
+      TF_VAR_skip_build: "false"
+      TF_VAR_install_monitoring: "false"
+      TF_VAR_image_tag: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.5"
+
+      - name: initialize Terraform
+        run: terraform -chdir=terraform init -input=false
+
+      - name: apply disposable kind infrastructure and application
+        run: terraform -chdir=terraform apply -auto-approve -input=false
+
+      - name: verify API and ingress
+        env:
+          KUBECONFIG: /tmp/api-gateway-terraform-ci.kubeconfig
+          LOCAL_PORT: "18081"
+        run: |
+          ./scripts/smoke-test.sh
+          api_key="$(kubectl -n api-gateway get secret gateway-secrets \
+            -o jsonpath='{.data.api-keys}' | openssl base64 -d -A | cut -d, -f1)"
+          curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-all-errors \
+            -H 'Host: gateway.local' -H "X-API-KEY: ${api_key}" \
+            http://127.0.0.1:18080/users
+
+      - name: destroy only the disposable Terraform cluster
+        if: always()
+        run: |
+          if [[ -f terraform/terraform.tfstate ]]; then
+            terraform -chdir=terraform destroy -auto-approve -input=false || destroy_status=$?
+          fi
+          if kind get clusters 2>/dev/null | grep -qx api-gateway-terraform-ci; then
+            kind delete cluster --name api-gateway-terraform-ci || destroy_status=$?
+          fi
+          rm -f /tmp/api-gateway-terraform-ci.kubeconfig
+          if [[ -n "${destroy_status:-}" ]]; then
+            echo "error: cleanup of api-gateway-terraform-ci did not complete successfully" >&2
+            exit "${destroy_status}"
+          fi

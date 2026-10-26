@@ -1,0 +1,34 @@
+---
+- name: Install base packages on Debian family
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - git
+      - jq
+      - make
+      - python3
+      - rsync
+      - unzip
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_os_family == "Debian"
+
+- name: Install base packages on RedHat family
+  ansible.builtin.dnf:
+    name:
+      - ca-certificates
+      - curl
+      - git
+      - jq
+      - make
+      - python3
+      - rsync
+      - unzip
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Verify make is available
+  ansible.builtin.command: make --version
+  changed_when: false

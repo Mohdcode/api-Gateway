@@ -1,0 +1,8 @@
+---
+kind_cluster_name: api-gateway
+
+gateway_deploy_dir: /opt/api-gateway
+gateway_registry: ghcr.io/mohdcode
+gateway_image_tag: dev
+gateway_overlay: dev
+gateway_install_monitoring: true

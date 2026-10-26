@@ -1,0 +1,17 @@
+.git
+.gitignore
+.github
+*.log
+*.test
+*.out
+coverage.*
+.DS_Store
+.idea
+.vscode
+deploy
+docs
+terraform
+ansible
+scripts
+README.md
+wrk_60s.txt
