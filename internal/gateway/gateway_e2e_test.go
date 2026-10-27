@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -52,7 +53,7 @@ func TestFullStackHTTPWithMetrics(t *testing.T) {
 
 	cfg := &Config{
 		Port:      ":0",
-		JwtSecret: "test-secret",
+		JwtSecret: "test-test-test-test-test-test-test-test",
 		Redis:     RedisConfig{Addr: mr.Addr()},
 		MiddlewareConfig: ConfigTypes{
 			ApiKeyAuth: ApiConfig{ValidKeys: []string{"key-a"}},
@@ -85,7 +86,7 @@ func TestFullStackHTTPWithMetrics(t *testing.T) {
 	okCounter := counter.WithLabelValues("GET", "200", "e2e-stack")
 	unauthorizedCounter := counter.WithLabelValues("GET", "401", "e2e-stack")
 	limitedCounter := counter.WithLabelValues("GET", "429", "e2e-limited")
-	limitedMetric := rateLimited.WithLabelValues("e2e-limited", "token_bucket")
+	limitedMetric := rateLimited.WithLabelValues("e2e-limited")
 
 	okBefore := testutil.ToFloat64(okCounter)
 	unauthorizedBefore := testutil.ToFloat64(unauthorizedCounter)
@@ -101,7 +102,7 @@ func TestFullStackHTTPWithMetrics(t *testing.T) {
 		t.Fatalf("valid key status = %d, want 200", rec.Code)
 	}
 
-	jwtToken := signJWT(t, "test-secret", jwt.SigningMethodHS256, jwt.MapClaims{
+	jwtToken := signJWT(t, "test-test-test-test-test-test-test-test", jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": "user-1",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
@@ -128,8 +129,8 @@ func TestFullStackHTTPWithMetrics(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("second limited request = %d, want 429", rec.Code)
 	}
-	if got := rec.Header().Get("Retry-After"); got != "1" {
-		t.Fatalf("Retry-After = %q, want \"1\"", got)
+	if got, err := strconv.Atoi(rec.Header().Get("Retry-After")); err != nil || got <= 0 || got > 10_000 {
+		t.Fatalf("Retry-After = %q, want a positive delay based on the configured refill rate", rec.Header().Get("Retry-After"))
 	}
 
 	if delta := testutil.ToFloat64(okCounter) - okBefore; delta != 8 {
@@ -157,7 +158,7 @@ func TestFullStackHTTPWithMetrics(t *testing.T) {
 		`http_request_counter{method="GET",service="e2e-limited",status="429"}`,
 		`http_request_timer_count{method="GET",service="e2e-stack"}`,
 		`gateway_circuit_breaker_state{service="e2e-stack"} 0`,
-		`gateway_rate_limited_total{reason="token_bucket",service="e2e-limited"}`,
+		`gateway_rate_limited_total{service="e2e-limited"}`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics is missing %q", want)
@@ -173,6 +174,9 @@ func TestProxyErrorReturns502(t *testing.T) {
 
 	svc := testService("dead", "/dead", []string{deadURL})
 	g := newTestGateway(t, testConfig(mr, svc))
+	// Exercise proxy error translation after backend selection, independently
+	// from the startup health gate.
+	g.config.Load().services["/dead"].backends[0].healthy.Store(true)
 
 	if rec := request(g, http.MethodGet, "/dead", nil); rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 for an unreachable backend", rec.Code)
@@ -226,13 +230,13 @@ func TestHealthCheckLoopTracksBackendState(t *testing.T) {
 	defer srv.Close()
 
 	svc := &Service{Name: "looped", Route: "/looped"}
-	b := &backend{url: srv.URL}
+	b := &backend{url: srv.URL, healthURL: srv.URL + "/health"}
 	b.healthy.Store(true)
 	svc.backends = []*backend{b}
 	m := map[string]*Service{"/looped": svc}
 
 	g := &Gateway{}
-	g.services.Store(&m)
+	g.storeConfiguration(m, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	g.startHealthChecksWith(ctx, 10*time.Millisecond)
@@ -261,11 +265,11 @@ func TestConfigWatcherReloadsAndKeepsLastGoodConfig(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	writeConfig(t, path, watchedConfig(mr.Addr(), backend.URL, "key-new"))
-	waitFor(t, 2*time.Second, func() bool { return g.auth.Load().keys["key-new"] })
+	waitFor(t, 2*time.Second, func() bool { return g.config.Load().auth.keys["key-new"] })
 
 	writeConfig(t, path, "services: [\n")
 	time.Sleep(150 * time.Millisecond)
-	if !g.auth.Load().keys["key-new"] {
+	if !g.config.Load().auth.keys["key-new"] {
 		t.Fatal("invalid config must not replace the running auth config")
 	}
 	if g.findService(httptest.NewRequest(http.MethodGet, "/watched", nil)) == nil {
@@ -278,17 +282,72 @@ func TestConfigWatcherReloadsAndKeepsLastGoodConfig(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	writeConfig(t, path, watchedConfig(mr.Addr(), backend.URL, "key-third"))
-	waitFor(t, 2*time.Second, func() bool { return g.auth.Load().keys["key-third"] })
+	waitFor(t, 2*time.Second, func() bool { return g.config.Load().auth.keys["key-third"] })
 
 	if rec := request(g, http.MethodGet, "/watched", map[string]string{"X-API-KEY": "key-third"}); rec.Code != http.StatusOK {
 		t.Fatalf("status after watcher reload = %d, want 200", rec.Code)
 	}
 }
 
+func TestConfigReloadDuringRequestKeepsOneSnapshot(t *testing.T) {
+	mr := newTestRedis(t)
+	requestStarted := make(chan struct{})
+	releaseOldRequest := make(chan struct{})
+	oldBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		close(requestStarted)
+		<-releaseOldRequest
+		_, _ = w.Write([]byte("old-backend"))
+	}))
+	defer oldBackend.Close()
+	newBackend := backendWithBody(t, "new-backend")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeConfig(t, path, watchedConfig(mr.Addr(), oldBackend.URL, "old-key"))
+	cfg, err := loadConfigPath(path)
+	if err != nil {
+		t.Fatalf("load initial config: %v", err)
+	}
+	g := newTestGateway(t, cfg)
+
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response <- request(g, http.MethodGet, "/watched", map[string]string{"X-API-KEY": "old-key"})
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old request did not reach its backend")
+	}
+
+	writeConfig(t, path, watchedConfig(mr.Addr(), newBackend.URL, "new-key"))
+	g.reloadConfig(path)
+	close(releaseOldRequest)
+
+	select {
+	case rec := <-response:
+		if rec.Code != http.StatusOK || rec.Body.String() != "old-backend" {
+			t.Fatalf("in-flight response = %d %q, want old backend response", rec.Code, rec.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight request")
+	}
+	if rec := request(g, http.MethodGet, "/watched", map[string]string{"X-API-KEY": "old-key"}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("old key after reload = %d, want 401", rec.Code)
+	}
+	if rec := request(g, http.MethodGet, "/watched", map[string]string{"X-API-KEY": "new-key"}); rec.Code != http.StatusOK || rec.Body.String() != "new-backend" {
+		t.Fatalf("new request after reload = %d %q, want new backend", rec.Code, rec.Body.String())
+	}
+}
+
 func watchedConfig(redisAddr, backendURL, key string) string {
 	return `
 port: ":0"
-jwt_secret: "test-secret"
+jwt_secret: "test-test-test-test-test-test-test-test"
 redis:
   addr: "` + redisAddr + `"
 middleware_config:

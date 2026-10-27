@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -61,9 +62,66 @@ func TestReadyzFailsWithoutConfiguration(t *testing.T) {
 	}
 }
 
+func TestReadyzRequiresHealthyBackendsAndRejectsDrain(t *testing.T) {
+	g := &Gateway{}
+	b := &backend{}
+	svc := &Service{Name: "users", Route: "/users", backends: []*backend{b}}
+	g.storeConfiguration(map[string]*Service{"/users": svc}, nil)
+
+	rec := httptest.NewRecorder()
+	g.readyzHandler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unhealthy readyz status = %d, want 503", rec.Code)
+	}
+
+	b.healthy.Store(true)
+	rec = httptest.NewRecorder()
+	g.readyzHandler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthy readyz status = %d, want 200", rec.Code)
+	}
+
+	g.draining.Store(true)
+	rec = httptest.NewRecorder()
+	g.readyzHandler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("draining readyz status = %d, want 503", rec.Code)
+	}
+}
+
+func TestNewGatewayDoesNotRouteBeforeInitialBackendHealthCheck(t *testing.T) {
+	mr := newTestRedis(t)
+	var applicationRequests atomic.Int64
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		applicationRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	g := newTestGateway(t, testConfig(mr, testService("users", "/users", []string{backend.URL})))
+	defer g.Close()
+	if got := request(g, http.MethodGet, "/users", nil); got.Code != http.StatusServiceUnavailable {
+		t.Fatalf("request to unhealthy backend = %d, want 503", got.Code)
+	}
+	if got := applicationRequests.Load(); got != 0 {
+		t.Fatalf("application requests reached an unhealthy backend: %d, want 0", got)
+	}
+	ready := httptest.NewRecorder()
+	g.readyzHandler(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz status = %d for unhealthy backend, want 503", ready.Code)
+	}
+}
+
 func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("PORT", ":9090")
 	t.Setenv("JWT_SECRET", "env-secret")
+	t.Setenv("JWT_ISSUER", "issuer")
+	t.Setenv("JWT_AUDIENCE", "gateway")
 	t.Setenv("REDIS_ADDR", "redis:6379")
 	t.Setenv("REDIS_PASSWORD", "redis-fixture")
 	t.Setenv("REDIS_DB", "3")
@@ -77,6 +135,9 @@ func TestApplyEnvOverrides(t *testing.T) {
 	}
 	if cfg.JwtSecret != "env-secret" {
 		t.Fatalf("jwt secret = %q", cfg.JwtSecret)
+	}
+	if cfg.JwtIssuer != "issuer" || cfg.JwtAudience != "gateway" {
+		t.Fatalf("jwt issuer/audience = %q/%q", cfg.JwtIssuer, cfg.JwtAudience)
 	}
 	if cfg.Redis.Addr != "redis:6379" || cfg.Redis.Password != "redis-fixture" || cfg.Redis.DB != 3 {
 		t.Fatalf("redis config = %+v", cfg.Redis)
@@ -127,6 +188,17 @@ func TestShutdownDelay(t *testing.T) {
 	t.Setenv("SHUTDOWN_DELAY", "-1s")
 	if got := shutdownDelay(); got != 0 {
 		t.Fatalf("negative shutdown delay = %s, want 0", got)
+	}
+}
+
+func TestPprofDisabledByDefault(t *testing.T) {
+	t.Setenv("PPROF_ADDR", "")
+	if got := pprofAddress(); got != "off" {
+		t.Fatalf("default pprof address = %q, want off", got)
+	}
+	t.Setenv("PPROF_ADDR", "127.0.0.1:6060")
+	if got := pprofAddress(); got != "127.0.0.1:6060" {
+		t.Fatalf("configured pprof address = %q", got)
 	}
 }
 

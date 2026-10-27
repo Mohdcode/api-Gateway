@@ -1,0 +1,15 @@
+title = "API Gateway Gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore the known, non-secret JWT fixture in the existing PR commit history; current test fixtures use a low-entropy placeholder."
+condition = "AND"
+regexTarget = "secret"
+regexes = [
+  '''0123456789abcdef0123456789abcdef''',
+]
+paths = [
+  '''^internal/gateway/.*_test\.go$''',
+]

@@ -29,3 +29,4 @@ images:
 patches:
   - path: hpa-patch.yaml
   - path: gateway-resources-patch.yaml
+  - path: pprof-patch.yaml

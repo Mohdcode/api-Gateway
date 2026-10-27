@@ -14,10 +14,19 @@ import (
 )
 
 func (g *Gateway) Close() error {
-	if g.rdb == nil {
-		return nil
-	}
-	return g.rdb.Close()
+	g.closeOnce.Do(func() {
+		if g.workerCancel != nil {
+			g.workerCancel()
+		}
+		g.workerWG.Wait()
+		if g.rdb != nil {
+			g.closeErr = g.rdb.Close()
+		}
+		if g.transport != nil {
+			g.transport.CloseIdleConnections()
+		}
+	})
+	return g.closeErr
 }
 
 func (g *Gateway) healthzHandler(w http.ResponseWriter, r *http.Request) {
@@ -27,9 +36,20 @@ func (g *Gateway) healthzHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if g.services.Load() == nil {
+	if g.draining.Load() {
+		http.Error(w, "gateway is draining", http.StatusServiceUnavailable)
+		return
+	}
+	snapshot := g.config.Load()
+	if snapshot == nil {
 		http.Error(w, "configuration not loaded", http.StatusServiceUnavailable)
 		return
+	}
+	for _, service := range snapshot.services {
+		if service.pickBackend() == nil {
+			http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

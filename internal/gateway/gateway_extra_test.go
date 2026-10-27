@@ -32,7 +32,7 @@ func TestStatusRecorderIgnoresDuplicateWriteHeaderAndUnwraps(t *testing.T) {
 
 func TestClientIdentityBranches(t *testing.T) {
 	g := &Gateway{}
-	g.auth.Store(&authConfig{jwtSecret: "test-secret"})
+	g.storeConfiguration(nil, &authConfig{keys: map[string]bool{"secret-key": true}, jwtSecret: "test-secret"})
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "1.2.3.4:5678"
@@ -48,6 +48,10 @@ func TestClientIdentityBranches(t *testing.T) {
 	req.Header.Set("X-API-KEY", "secret-key")
 	if got := g.clientIdentity(req); got != "key:"+hashSecret("secret-key", "test-secret") {
 		t.Fatalf("api-key identity = %q, want hashed key", got)
+	}
+	req.Header.Set("X-API-KEY", "spoofed-key")
+	if got := g.clientIdentity(req); got != "ip:1.2.3.4" {
+		t.Fatalf("unvalidated API-key identity = %q, want IP fallback", got)
 	}
 
 	ctx := context.WithValue(req.Context(), identityKey, "jwt:abc")
@@ -94,7 +98,7 @@ func TestAuthMiddlewareWithoutConfiguration(t *testing.T) {
 
 func TestAuthJWTWithoutSubjectUsesTokenHash(t *testing.T) {
 	g := &Gateway{}
-	g.auth.Store(&authConfig{keys: map[string]bool{}, jwtSecret: "test-secret"})
+	g.storeConfiguration(nil, &authConfig{keys: map[string]bool{}, jwtSecret: "test-secret"})
 
 	identity := ""
 	handler := g.authAPIKeyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -118,13 +122,21 @@ func TestAuthJWTWithoutSubjectUsesTokenHash(t *testing.T) {
 	}
 }
 
-func TestNewAuthConfigDefaults(t *testing.T) {
+func TestNewAuthConfigDoesNotInventJWTSecret(t *testing.T) {
 	auth := newAuthConfig(&Config{})
-	if auth.jwtSecret != "default_secret_key" {
-		t.Fatalf("jwtSecret = %q, want default_secret_key", auth.jwtSecret)
+	if auth.jwtSecret != "" {
+		t.Fatalf("jwtSecret = %q, want empty (NewGateway rejects a missing secret)", auth.jwtSecret)
 	}
 	if len(auth.keys) != 0 {
 		t.Fatalf("keys = %v, want empty", auth.keys)
+	}
+}
+
+func TestNewGatewayRequiresJWTSecret(t *testing.T) {
+	for _, secret := range []string{"", "too-short"} {
+		if _, err := NewGateway(&Config{JwtSecret: secret}); err == nil || !strings.Contains(err.Error(), "jwt_secret must be at least 32 bytes") {
+			t.Fatalf("NewGateway error for %q = %v, want minimum-length jwt_secret error", secret, err)
+		}
 	}
 }
 
@@ -132,7 +144,7 @@ func TestNewGatewayWarnsWhenRedisIsUnavailable(t *testing.T) {
 	backend := backendWithBody(t, "ok")
 	cfg := &Config{
 		Port:      ":0",
-		JwtSecret: "test-secret",
+		JwtSecret: "test-test-test-test-test-test-test-test",
 		Redis:     RedisConfig{Addr: "127.0.0.1:1"},
 		Services:  []Service{testService("users", "/users", []string{backend.URL}, "auth_apikey")},
 	}
@@ -145,9 +157,10 @@ func TestNewGatewayWarnsWhenRedisIsUnavailable(t *testing.T) {
 func TestNewGatewayReturnsErrorForInvalidServices(t *testing.T) {
 	mr := newTestRedis(t)
 	cfg := &Config{
-		Port:     ":0",
-		Redis:    RedisConfig{Addr: mr.Addr()},
-		Services: []Service{{Name: "broken", Route: "/broken"}},
+		Port:      ":0",
+		JwtSecret: "test-test-test-test-test-test-test-test",
+		Redis:     RedisConfig{Addr: mr.Addr()},
+		Services:  []Service{{Name: "broken", Route: "/broken"}},
 	}
 	if _, err := NewGateway(cfg); err == nil {
 		t.Fatal("expected an error for a service with no urls")
@@ -182,8 +195,8 @@ func TestBuildServicesValidConfigCopiesFields(t *testing.T) {
 		t.Fatalf("backends = %d, want 2", len(svc.backends))
 	}
 	for _, b := range svc.backends {
-		if !b.healthy.Load() {
-			t.Fatalf("backend %s should start healthy", b.url)
+		if b.healthy.Load() {
+			t.Fatalf("backend %s should remain unverified until its health check", b.url)
 		}
 		if b.proxy == nil {
 			t.Fatalf("backend %s has no proxy", b.url)
@@ -215,6 +228,7 @@ func TestPickBackendWithNoBackends(t *testing.T) {
 
 func TestHandleGatewayUnknownRoute(t *testing.T) {
 	g := &Gateway{}
+	g.storeConfiguration(map[string]*Service{"/users": {Name: "users", Route: "/users"}}, nil)
 	rec := request(g, http.MethodGet, "/missing", nil)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
@@ -318,7 +332,7 @@ func TestRateLimiterUsesHashedKeysAndTTL(t *testing.T) {
 	if strings.Contains(bucket, "key-a") {
 		t.Fatalf("rate-limit key %q leaks the raw API key", bucket)
 	}
-	if !strings.Contains(bucket, hashSecret("key-a", "test-secret")) {
+	if !strings.Contains(bucket, hashSecret("key-a", "test-test-test-test-test-test-test-test")) {
 		t.Fatalf("rate-limit key %q does not contain the hashed identity", bucket)
 	}
 	if ttl := mr.TTL(bucket); ttl <= 0 {

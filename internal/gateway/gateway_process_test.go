@@ -38,7 +38,7 @@ func TestProcessLifecycle(t *testing.T) {
 
 	configPath := filepath.Join(dir, "config.yaml")
 	config := fmt.Sprintf(`port: ":%d"
-jwt_secret: "test-secret"
+jwt_secret: "test-test-test-test-test-test-test-test"
 redis:
   addr: "127.0.0.1:1"
   db: 0
