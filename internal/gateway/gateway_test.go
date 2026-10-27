@@ -44,7 +44,7 @@ func testService(name, route string, urls []string, middleware ...string) Servic
 func testConfig(mr *miniredis.Miniredis, services ...Service) *Config {
 	return &Config{
 		Port:      ":0",
-		JwtSecret: "0123456789abcdef0123456789abcdef",
+		JwtSecret: "test-test-test-test-test-test-test-test",
 		Redis:     RedisConfig{Addr: mr.Addr()},
 		MiddlewareConfig: ConfigTypes{
 			ApiKeyAuth: ApiConfig{ValidKeys: []string{"key-a", "key-b"}},
@@ -769,7 +769,7 @@ func TestReloadConfigReplacesServicesAndKeys(t *testing.T) {
 	path := filepath.Join(dir, "config.yaml")
 	writeConfig(t, path, `
 port: ":0"
-jwt_secret: "0123456789abcdef0123456789abcdef"
+jwt_secret: "test-test-test-test-test-test-test-test"
 redis:
   addr: "`+mr.Addr()+`"
 middleware_config:
@@ -796,7 +796,7 @@ services:
 
 	writeConfig(t, path, `
 port: ":0"
-jwt_secret: "0123456789abcdef0123456789abcdef"
+jwt_secret: "test-test-test-test-test-test-test-test"
 redis:
   addr: "`+mr.Addr()+`"
 middleware_config:

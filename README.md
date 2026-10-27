@@ -160,7 +160,7 @@ go test -race -count=1 -cover ./...
 go vet ./...
 ```
 
-The test suite uses miniredis and httptest; Go tests do not require external Redis or backends. The CI workflow runs on pushes and pull requests. See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+The test suite uses miniredis and httptest; Go tests do not require external Redis or backends. The CI workflow runs on pushes and pull requests. The separate [security workflow](.github/workflows/security.yml) runs CodeQL, govulncheck, a Trivy filesystem scan, and Gitleaks on pull requests, pushes to `main`, and a weekly schedule. The Gitleaks job has `continue-on-error` enabled, so the workflow can continue after findings, while its individual check may still display a failure.
 
 ## Metrics and profiling
 

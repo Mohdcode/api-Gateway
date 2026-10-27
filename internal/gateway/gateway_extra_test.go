@@ -144,7 +144,7 @@ func TestNewGatewayWarnsWhenRedisIsUnavailable(t *testing.T) {
 	backend := backendWithBody(t, "ok")
 	cfg := &Config{
 		Port:      ":0",
-		JwtSecret: "0123456789abcdef0123456789abcdef",
+		JwtSecret: "test-test-test-test-test-test-test-test",
 		Redis:     RedisConfig{Addr: "127.0.0.1:1"},
 		Services:  []Service{testService("users", "/users", []string{backend.URL}, "auth_apikey")},
 	}
@@ -158,7 +158,7 @@ func TestNewGatewayReturnsErrorForInvalidServices(t *testing.T) {
 	mr := newTestRedis(t)
 	cfg := &Config{
 		Port:      ":0",
-		JwtSecret: "0123456789abcdef0123456789abcdef",
+		JwtSecret: "test-test-test-test-test-test-test-test",
 		Redis:     RedisConfig{Addr: mr.Addr()},
 		Services:  []Service{{Name: "broken", Route: "/broken"}},
 	}
@@ -332,7 +332,7 @@ func TestRateLimiterUsesHashedKeysAndTTL(t *testing.T) {
 	if strings.Contains(bucket, "key-a") {
 		t.Fatalf("rate-limit key %q leaks the raw API key", bucket)
 	}
-	if !strings.Contains(bucket, hashSecret("key-a", "0123456789abcdef0123456789abcdef")) {
+	if !strings.Contains(bucket, hashSecret("key-a", "test-test-test-test-test-test-test-test")) {
 		t.Fatalf("rate-limit key %q does not contain the hashed identity", bucket)
 	}
 	if ttl := mr.TTL(bucket); ttl <= 0 {

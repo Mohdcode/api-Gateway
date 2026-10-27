@@ -53,7 +53,7 @@ func TestFullStackHTTPWithMetrics(t *testing.T) {
 
 	cfg := &Config{
 		Port:      ":0",
-		JwtSecret: "0123456789abcdef0123456789abcdef",
+		JwtSecret: "test-test-test-test-test-test-test-test",
 		Redis:     RedisConfig{Addr: mr.Addr()},
 		MiddlewareConfig: ConfigTypes{
 			ApiKeyAuth: ApiConfig{ValidKeys: []string{"key-a"}},
@@ -102,7 +102,7 @@ func TestFullStackHTTPWithMetrics(t *testing.T) {
 		t.Fatalf("valid key status = %d, want 200", rec.Code)
 	}
 
-	jwtToken := signJWT(t, "0123456789abcdef0123456789abcdef", jwt.SigningMethodHS256, jwt.MapClaims{
+	jwtToken := signJWT(t, "test-test-test-test-test-test-test-test", jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": "user-1",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
@@ -347,7 +347,7 @@ func TestConfigReloadDuringRequestKeepsOneSnapshot(t *testing.T) {
 func watchedConfig(redisAddr, backendURL, key string) string {
 	return `
 port: ":0"
-jwt_secret: "0123456789abcdef0123456789abcdef"
+jwt_secret: "test-test-test-test-test-test-test-test"
 redis:
   addr: "` + redisAddr + `"
 middleware_config:
